@@ -19,6 +19,7 @@ LDFLAGS = -L$(SYSROOT_LIB) \
           -l:libswscale.so.7 \
           -l:libswresample.so.4 \
           -l:libavutil.so.58 \
+          -ldrm \
           -lm -lpthread
 
 TARGET = movies

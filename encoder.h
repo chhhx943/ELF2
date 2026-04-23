@@ -1,3 +1,4 @@
+
 #ifndef __ENCODER_H
 #define __ENCODER_H
 
@@ -20,6 +21,7 @@ typedef struct {
 
 int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height, int fps);
 int streamer_push(FFmpegStreamer *s,uint8_t *nv12_data);
+int streamer_push_zerocopy(FFmpegStreamer *s, int dma_fd);
 int streamer_clean(FFmpegStreamer *s);
 
 
