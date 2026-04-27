@@ -20,7 +20,7 @@ int send_fd(int socket, int fd_to_send) {
     msg.msg_control = u.cmsg_space;
     msg.msg_controllen = sizeof(u.cmsg_space);
 
-    // ÅäÖÃ SCM_RIGHTS Ä§·¨
+    // ÅäÖÃ SCM_RIGHTS 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
