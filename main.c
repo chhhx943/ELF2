@@ -191,6 +191,7 @@ int main() {
 
 cleanup:
         is_running = 0;
+        stop_mqtt_reporter();
         // 清理回收
         camera_stop(&cam);
         camera_deinit(&cam);
