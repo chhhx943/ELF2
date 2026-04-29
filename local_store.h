@@ -53,6 +53,7 @@ int local_store_fetch_batch(LocalStore *store,
                             int *count_out);
 int local_store_delete(LocalStore *store, int64_t id);
 int local_store_pending_count(LocalStore *store, int *count_out);
+
 int local_store_debug_selftest(const char *root_dir);
 int local_store_debug_dump(const char *root_dir, int limit);
 

@@ -30,7 +30,8 @@
 #define FRAME_SIZE (WIDTH * HEIGHT * 3 / 2)
 #define SENSOR_DEVICE_ENV "SENSOR_MODBUS_DEV"
 #define SENSOR_DEVICE_DEFAULT "/dev/ttyUSB0"
-#define STREAM_RESTART_INTERVAL_MS 3000
+#define STREAM_RESTART_BASE_MS 1000
+#define STREAM_RESTART_MAX_MS 30000
 
 volatile sig_atomic_t is_running = 1;
 
@@ -38,7 +39,10 @@ typedef struct {
     int stream_online;
     pid_t child_pid;
     int parent_sock;
-    int restart_interval_ms;
+    int base_restart_ms;
+    int max_restart_ms;
+    int current_restart_ms;
+    int restart_fail_count;
     int64_t last_restart_ms;
 } StreamState;
 
@@ -55,6 +59,21 @@ static int64_t now_ms(void) {
     }
 
     return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void reset_restart_backoff(StreamState *stream) {
+    stream->restart_fail_count = 0;
+    stream->current_restart_ms = stream->base_restart_ms;
+}
+
+static void increase_restart_backoff(StreamState *stream) {
+    int next_delay = stream->current_restart_ms * 2;
+
+    stream->restart_fail_count++;
+    if (next_delay > stream->max_restart_ms) {
+        next_delay = stream->max_restart_ms;
+    }
+    stream->current_restart_ms = next_delay;
 }
 
 static void mark_stream_offline(StreamState *stream) {
@@ -164,6 +183,7 @@ static int spawn_stream_child(StreamState *stream) {
     stream->parent_sock = sv[0];
     stream->child_pid = pid;
     stream->stream_online = 1;
+    reset_restart_backoff(stream);
     stream->last_restart_ms = now_ms();
 
     printf("[Parent] Stream child started: pid=%d\n", pid);
@@ -190,15 +210,19 @@ static void try_restart_stream_child(StreamState *stream) {
     }
 
     now = now_ms();
-    if (now - stream->last_restart_ms < stream->restart_interval_ms) {
+    if (now - stream->last_restart_ms < stream->current_restart_ms) {
         return;
     }
 
     stream->last_restart_ms = now;
-    printf("[Parent] Try restart stream child...\n");
+    printf("[Parent] Try restart stream child after %d ms backoff...\n",
+           stream->current_restart_ms);
 
     if (spawn_stream_child(stream) < 0) {
-        printf("[Parent] Restart stream child failed.\n");
+        increase_restart_backoff(stream);
+        printf("[Parent] Restart stream child failed, fail_count=%d, next backoff=%d ms.\n",
+               stream->restart_fail_count,
+               stream->current_restart_ms);
     }
 }
 
@@ -208,7 +232,10 @@ int main(void) {
         .stream_online = 0,
         .child_pid = -1,
         .parent_sock = -1,
-        .restart_interval_ms = STREAM_RESTART_INTERVAL_MS,
+        .base_restart_ms = STREAM_RESTART_BASE_MS,
+        .max_restart_ms = STREAM_RESTART_MAX_MS,
+        .current_restart_ms = STREAM_RESTART_BASE_MS,
+        .restart_fail_count = 0,
         .last_restart_ms = 0,
     };
     int shmid = -1;
