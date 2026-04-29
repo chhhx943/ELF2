@@ -33,7 +33,7 @@ LDFLAGS = -L$(SYSROOT_LIB) \
 TARGET = main
 STORE_DEBUG_TARGET = store_debug
 MQTT_CHAIN_DEBUG_TARGET = mqtt_chain_debug
-SRCS = main.c camera.c ipc.c encoder.c aliyun_mqtt.c sensor_modbus.c local_store.c
+SRCS = main.c camera.c ipc.c encoder.c aliyun_mqtt.c sensor_modbus.c local_store.c video_store.c
 OBJS = $(SRCS:.c=.o)
 STORE_DEBUG_OBJS = store_debug.o local_store.o
 MQTT_CHAIN_DEBUG_OBJS = mqtt_chain_debug.o aliyun_mqtt.o local_store.o

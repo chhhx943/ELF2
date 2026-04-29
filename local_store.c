@@ -113,6 +113,22 @@ static void local_store_fill_record(sqlite3_stmt *stmt, LocalStoreRecord *record
     local_store_copy_string(record->media_path, sizeof(record->media_path), (const char *)media_path);
 }
 
+static void local_store_fill_video_segment_record(sqlite3_stmt *stmt, LocalVideoSegmentRecord *record) {
+    const unsigned char *file_path;
+    const unsigned char *state;
+
+    record->id = sqlite3_column_int64(stmt, 0);
+    record->start_ms = sqlite3_column_int64(stmt, 1);
+    record->end_ms = sqlite3_column_int64(stmt, 2);
+    record->size_bytes = sqlite3_column_int64(stmt, 3);
+    state = sqlite3_column_text(stmt, 4);
+    file_path = sqlite3_column_text(stmt, 5);
+    record->created_at_ms = sqlite3_column_int64(stmt, 6);
+
+    local_store_copy_string(record->state, sizeof(record->state), (const char *)state);
+    local_store_copy_string(record->file_path, sizeof(record->file_path), (const char *)file_path);
+}
+
 static int64_t local_store_now_ms(void) {
     struct timespec ts;
 
@@ -178,8 +194,21 @@ static int local_store_init_schema(LocalStore *store) {
         "media_type TEXT NOT NULL DEFAULT '',"
         "media_path TEXT NOT NULL DEFAULT ''"
         ");"
+        "CREATE TABLE IF NOT EXISTS video_segments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "start_ms INTEGER NOT NULL,"
+        "end_ms INTEGER NOT NULL DEFAULT 0,"
+        "size_bytes INTEGER NOT NULL DEFAULT 0,"
+        "state TEXT NOT NULL,"
+        "file_path TEXT NOT NULL,"
+        "created_at_ms INTEGER NOT NULL"
+        ");"
         "CREATE INDEX IF NOT EXISTS idx_offline_queue_created_at "
-        "ON offline_queue(created_at_ms);";
+        "ON offline_queue(created_at_ms);"
+        "CREATE INDEX IF NOT EXISTS idx_video_segments_start_ms "
+        "ON video_segments(start_ms);"
+        "CREATE INDEX IF NOT EXISTS idx_video_segments_state "
+        "ON video_segments(state);";
 
     return local_store_exec(store, kSchemaSql);
 }
@@ -435,6 +464,176 @@ int local_store_pending_count(LocalStore *store, int *count_out) {
     }
 
     *count_out = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+int local_store_register_video_segment(LocalStore *store,
+                                       int64_t start_ms,
+                                       const char *file_path,
+                                       const char *state,
+                                       int64_t *segment_id_out) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL || file_path == NULL || state == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "INSERT INTO video_segments (start_ms, state, file_path, created_at_ms) "
+        "VALUES (?, ?, ?, ?);",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_int64(stmt, 1, start_ms);
+    sqlite3_bind_text(stmt, 2, state, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, file_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, local_store_now_ms());
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    if (segment_id_out != NULL) {
+        *segment_id_out = sqlite3_last_insert_rowid(store->db);
+    }
+
+    return 0;
+}
+
+int local_store_update_video_segment(LocalStore *store,
+                                     int64_t segment_id,
+                                     int64_t end_ms,
+                                     int64_t size_bytes,
+                                     const char *state) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL || state == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "UPDATE video_segments SET end_ms = ?, size_bytes = ?, state = ? WHERE id = ?;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_int64(stmt, 1, end_ms);
+    sqlite3_bind_int64(stmt, 2, size_bytes);
+    sqlite3_bind_text(stmt, 3, state, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, segment_id);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+int local_store_delete_video_segment(LocalStore *store, int64_t segment_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(store->db, "DELETE FROM video_segments WHERE id = ?;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_int64(stmt, 1, segment_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+int local_store_fetch_oldest_prunable_video_segment(LocalStore *store,
+                                                    LocalVideoSegmentRecord *record,
+                                                    int *found_out) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL || record == NULL || found_out == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "SELECT id, start_ms, end_ms, size_bytes, state, file_path, created_at_ms "
+        "FROM video_segments "
+        "WHERE state IN ('uploaded', 'pending', 'broken') "
+        "ORDER BY start_ms ASC LIMIT 1;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        local_store_fill_video_segment_record(stmt, record);
+        *found_out = 1;
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    *found_out = 0;
+    return 0;
+}
+
+int local_store_video_total_size(LocalStore *store, int64_t *bytes_out) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL || bytes_out == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "SELECT COALESCE(SUM(size_bytes), 0) FROM video_segments "
+        "WHERE state IN ('recording', 'pending', 'uploaded', 'broken');",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return EIO;
+    }
+
+    *bytes_out = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
     return 0;
 }

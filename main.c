@@ -3,6 +3,7 @@
 #include "encoder.h"
 #include "sensor_modbus.h"
 #include "aliyun_mqtt.h"
+#include "video_store.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -32,6 +33,8 @@
 #define SENSOR_DEVICE_DEFAULT "/dev/ttyUSB0"
 #define STREAM_RESTART_BASE_MS 1000
 #define STREAM_RESTART_MAX_MS 30000
+#define CHILD_RTMP_RETRY_BASE_MS 1000
+#define CHILD_RTMP_RETRY_MAX_MS 30000
 
 volatile sig_atomic_t is_running = 1;
 
@@ -45,6 +48,34 @@ typedef struct {
     int restart_fail_count;
     int64_t last_restart_ms;
 } StreamState;
+
+typedef enum {
+    CHILD_OUTPUT_RTMP = 0,
+    CHILD_OUTPUT_FILE = 1
+} ChildOutputMode;
+
+typedef struct {
+    FFmpegStreamer streamer;
+    int streamer_ready;
+    ChildOutputMode mode;
+
+    LocalStore store;
+    int store_ready;
+    VideoStore video_store;
+    int video_store_ready;
+
+    int64_t current_segment_id;
+    int64_t current_segment_start_ms;
+    char current_segment_path[PATH_MAX];
+
+    int rtmp_retry_backoff_ms;
+    int rtmp_retry_max_ms;
+    int64_t last_rtmp_retry_ms;
+
+    int debug_rtmp_fail_after_frames;
+    int debug_rtmp_frame_count;
+    int debug_rtmp_fail_triggered;
+} ChildOutputCtx;
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -74,6 +105,37 @@ static void increase_restart_backoff(StreamState *stream) {
         next_delay = stream->max_restart_ms;
     }
     stream->current_restart_ms = next_delay;
+}
+
+static void child_reset_rtmp_backoff(ChildOutputCtx *ctx) {
+    ctx->rtmp_retry_backoff_ms = CHILD_RTMP_RETRY_BASE_MS;
+}
+
+static void child_increase_rtmp_backoff(ChildOutputCtx *ctx) {
+    int next_delay = ctx->rtmp_retry_backoff_ms * 2;
+
+    if (next_delay > ctx->rtmp_retry_max_ms) {
+        next_delay = ctx->rtmp_retry_max_ms;
+    }
+    ctx->rtmp_retry_backoff_ms = next_delay;
+}
+
+static int env_to_positive_int(const char *name, int fallback) {
+    const char *value = getenv(name);
+    char *endptr = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &endptr, 10);
+    if (errno != 0 || endptr == value || *endptr != '\0' || parsed <= 0) {
+        return fallback;
+    }
+
+    return (int)parsed;
 }
 
 static void mark_stream_offline(StreamState *stream) {
@@ -110,48 +172,272 @@ static void stop_stream_child(StreamState *stream) {
     stream->stream_online = 0;
 }
 
+static void child_reset_streamer(ChildOutputCtx *ctx) {
+    memset(&ctx->streamer, 0, sizeof(ctx->streamer));
+    ctx->streamer_ready = 0;
+}
+
+static int child_open_rtmp_output(ChildOutputCtx *ctx) {
+    child_reset_streamer(ctx);
+
+    if (streamer_init(&ctx->streamer, RTMP_URL, WIDTH, HEIGHT, 30) < 0) {
+        fprintf(stderr, "[Child] Streamer init failed for RTMP\n");
+        child_reset_streamer(ctx);
+        return -1;
+    }
+
+    ctx->streamer_ready = 1;
+    ctx->mode = CHILD_OUTPUT_RTMP;
+    child_reset_rtmp_backoff(ctx);
+    return 0;
+}
+
+static int child_close_file_segment(ChildOutputCtx *ctx, int broken) {
+    int64_t end_ms;
+    int64_t size_bytes = 0;
+    int64_t bytes_after = 0;
+    int deleted_count = 0;
+    int rc = 0;
+
+    if (ctx->mode != CHILD_OUTPUT_FILE || !ctx->streamer_ready) {
+        return 0;
+    }
+
+    end_ms = now_ms();
+    streamer_clean(&ctx->streamer);
+    child_reset_streamer(ctx);
+
+    rc = video_store_get_file_size(ctx->current_segment_path, &size_bytes);
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to stat segment %s: %d\n",
+                ctx->current_segment_path, rc);
+        size_bytes = 0;
+    }
+
+    if (ctx->current_segment_id > 0) {
+        if (broken) {
+            rc = video_store_mark_segment_broken(&ctx->video_store,
+                                                 ctx->current_segment_id,
+                                                 end_ms,
+                                                 size_bytes);
+        } else {
+            rc = video_store_finish_segment(&ctx->video_store,
+                                            ctx->current_segment_id,
+                                            end_ms,
+                                            size_bytes);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "[Child] Failed to update segment metadata: %d\n", rc);
+        }
+    }
+
+    rc = video_store_prune(&ctx->video_store, &bytes_after, &deleted_count);
+    if (rc == 0 && deleted_count > 0) {
+        printf("[Child] Video prune done, deleted=%d, bytes_after=%lld\n",
+               deleted_count, (long long)bytes_after);
+    }
+
+    ctx->current_segment_id = 0;
+    ctx->current_segment_start_ms = 0;
+    ctx->current_segment_path[0] = '\0';
+    return 0;
+}
+
+static int child_open_file_segment(ChildOutputCtx *ctx, int64_t start_ms) {
+    int rc;
+    int64_t segment_id = 0;
+    char segment_path[PATH_MAX];
+
+    if (!ctx->video_store_ready) {
+        return -1;
+    }
+
+    rc = video_store_build_segment_path(&ctx->video_store, start_ms, segment_path, sizeof(segment_path));
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to build segment path: %d\n", rc);
+        return -1;
+    }
+
+    rc = video_store_begin_segment(&ctx->video_store, start_ms, segment_path, &segment_id);
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to register segment: %d\n", rc);
+        return -1;
+    }
+
+    child_reset_streamer(ctx);
+    if (streamer_init(&ctx->streamer, segment_path, WIDTH, HEIGHT, 30) < 0) {
+        fprintf(stderr, "[Child] Streamer init failed for local segment\n");
+        local_store_delete_video_segment(&ctx->store, segment_id);
+        child_reset_streamer(ctx);
+        return -1;
+    }
+
+    ctx->streamer_ready = 1;
+    ctx->mode = CHILD_OUTPUT_FILE;
+    ctx->current_segment_id = segment_id;
+    ctx->current_segment_start_ms = start_ms;
+    snprintf(ctx->current_segment_path, sizeof(ctx->current_segment_path), "%s", segment_path);
+
+    printf("[Child] Local segment started: %s\n", ctx->current_segment_path);
+    return 0;
+}
+
+static int child_switch_to_file_mode(ChildOutputCtx *ctx, int64_t frame_ms) {
+    if (ctx->streamer_ready) {
+        streamer_clean(&ctx->streamer);
+        child_reset_streamer(ctx);
+    }
+
+    ctx->mode = CHILD_OUTPUT_FILE;
+    ctx->last_rtmp_retry_ms = frame_ms;
+    child_reset_rtmp_backoff(ctx);
+
+    return child_open_file_segment(ctx, frame_ms);
+}
+
+static int child_rotate_or_restore_output(ChildOutputCtx *ctx, int64_t frame_ms) {
+    int rc;
+
+    if (ctx->mode != CHILD_OUTPUT_FILE || !ctx->streamer_ready) {
+        return 0;
+    }
+
+    if (frame_ms - ctx->current_segment_start_ms < ctx->video_store.segment_duration_ms) {
+        return 0;
+    }
+
+    child_close_file_segment(ctx, 0);
+
+    if (frame_ms - ctx->last_rtmp_retry_ms >= ctx->rtmp_retry_backoff_ms) {
+        ctx->last_rtmp_retry_ms = frame_ms;
+        if (child_open_rtmp_output(ctx) == 0) {
+            printf("[Child] RTMP output restored.\n");
+            return 0;
+        }
+
+        child_increase_rtmp_backoff(ctx);
+        printf("[Child] RTMP restore failed, next backoff=%d ms.\n",
+               ctx->rtmp_retry_backoff_ms);
+    }
+
+    rc = child_open_file_segment(ctx, frame_ms);
+    if (rc != 0) {
+        fprintf(stderr, "[Child] Failed to open next local segment.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 static int child_stream_loop(int sock) {
-    FFmpegStreamer streamer;
-    AVPacket *pkt;
+    ChildOutputCtx ctx;
+    int64_t frame_ms;
     int child_fd;
     int ret;
 
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
 
-    if (streamer_init(&streamer, RTMP_URL, WIDTH, HEIGHT, 30) < 0) {
-        fprintf(stderr, "[Child] Streamer init failed\n");
-        return -1;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.rtmp_retry_backoff_ms = CHILD_RTMP_RETRY_BASE_MS;
+    ctx.rtmp_retry_max_ms = CHILD_RTMP_RETRY_MAX_MS;
+    ctx.debug_rtmp_fail_after_frames = env_to_positive_int("CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES", 0);
+    if (ctx.debug_rtmp_fail_after_frames > 0) {
+        printf("[Child] Debug RTMP fail will trigger after %d frames.\n",
+               ctx.debug_rtmp_fail_after_frames);
+    }
+
+    if (local_store_open(&ctx.store, NULL) == 0) {
+        ctx.store_ready = 1;
+        if (video_store_init(&ctx.video_store, &ctx.store, NULL) == 0) {
+            ctx.video_store_ready = 1;
+            printf("[Child] Video store ready, segment_ms=%lld, high_water=%lld, low_water=%lld\n",
+                   (long long)ctx.video_store.segment_duration_ms,
+                   (long long)ctx.video_store.high_water_bytes,
+                   (long long)ctx.video_store.low_water_bytes);
+        } else {
+            fprintf(stderr, "[Child] video_store_init failed\n");
+        }
+    } else {
+        fprintf(stderr, "[Child] local_store_open failed, file mode unavailable\n");
+    }
+
+    if (child_open_rtmp_output(&ctx) < 0) {
+        fprintf(stderr, "[Child] RTMP init failed, switch to local file mode.\n");
+        if (child_switch_to_file_mode(&ctx, now_ms()) < 0) {
+            return -1;
+        }
     }
 
     while ((child_fd = recv_fd(sock)) >= 0) {
-        ret = streamer_push_zerocopy(&streamer, child_fd);
-        close(child_fd);
+        frame_ms = now_ms();
+
+        if (ctx.mode == CHILD_OUTPUT_FILE) {
+            ret = child_rotate_or_restore_output(&ctx, frame_ms);
+            if (ret < 0) {
+                close(child_fd);
+                break;
+            }
+        }
+
+        if (ctx.mode == CHILD_OUTPUT_RTMP &&
+            ctx.debug_rtmp_fail_after_frames > 0 &&
+            !ctx.debug_rtmp_fail_triggered) {
+            ctx.debug_rtmp_frame_count++;
+            if (ctx.debug_rtmp_frame_count >= ctx.debug_rtmp_fail_after_frames) {
+                ctx.debug_rtmp_fail_triggered = 1;
+                ret = -1;
+                fprintf(stderr, "[Child] Debug: simulate RTMP disconnect at frame %d.\n",
+                        ctx.debug_rtmp_frame_count);
+            } else {
+                ret = streamer_push_zerocopy(&ctx.streamer, child_fd);
+            }
+        } else {
+            ret = streamer_push_zerocopy(&ctx.streamer, child_fd);
+        }
 
         if (ret < 0) {
+            if (ctx.mode == CHILD_OUTPUT_RTMP && ctx.video_store_ready) {
+                fprintf(stderr, "[Child] RTMP push failed, switch to local file mode.\n");
+                if (child_switch_to_file_mode(&ctx, frame_ms) == 0) {
+                    ret = streamer_push_zerocopy(&ctx.streamer, child_fd);
+                    if (ret == 0) {
+                        char ack = 'k';
+                        if (write(sock, &ack, 1) <= 0) {
+                            close(child_fd);
+                            break;
+                        }
+                        close(child_fd);
+                        continue;
+                    }
+                }
+            }
+
+            close(child_fd);
             fprintf(stderr, "[Child] Push failed, exit child loop.\n");
             break;
         }
 
         char ack = 'k';
         if (write(sock, &ack, 1) <= 0) {
+            close(child_fd);
             break;
         }
+
+        close(child_fd);
     }
 
-    avcodec_send_frame(streamer.enc_ctx, NULL);
-    pkt = av_packet_alloc();
-    while (pkt != NULL && avcodec_receive_packet(streamer.enc_ctx, pkt) >= 0) {
-        av_packet_rescale_ts(pkt, streamer.enc_ctx->time_base, streamer.video_st->time_base);
-        pkt->stream_index = streamer.video_st->index;
-        if (av_interleaved_write_frame(streamer.fmt_ctx, pkt) < 0) {
-            break;
-        }
-        av_packet_unref(pkt);
+    if (ctx.mode == CHILD_OUTPUT_FILE && ctx.streamer_ready) {
+        child_close_file_segment(&ctx, 0);
+    } else if (ctx.streamer_ready) {
+        streamer_clean(&ctx.streamer);
+        child_reset_streamer(&ctx);
     }
-    av_packet_free(&pkt);
 
-    streamer_clean(&streamer);
+    if (ctx.store_ready) {
+        local_store_close(&ctx.store);
+    }
+
     return 0;
 }
 

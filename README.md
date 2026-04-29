@@ -93,7 +93,42 @@
 
 一旦 RTMP 写失败，编码函数会返回错误，子进程会退出。父进程随后会把推流状态切成离线，并进入定时重启流程。
 
-### 6. 离线缓存逻辑
+### 6. 视频断网落盘逻辑
+
+当前已经接入一个最小闭环版本的视频本地转存逻辑：
+
+- 子进程启动时优先尝试 RTMP 输出
+- 如果 RTMP 初始化失败，立即切到本地 `.ts` 分片模式
+- 如果 RTMP 运行中写失败，当前子进程不退出，而是切到本地 `.ts` 分片模式继续写文件
+- 本地文件模式下会按固定片段时长轮转
+- 每个片段都会在 SQLite 的 `video_segments` 表中登记索引
+- 超过容量阈值时自动删除最旧片段
+- 到达片段轮转点时，会顺带尝试恢复 RTMP，成功后切回实时推流
+
+当前默认参数：
+
+- 片段时长：`30s`
+- 总容量上限目标：约 `3GB`
+- 高水位：`2.8GB`
+- 低水位：`2.5GB`
+
+默认视频目录在：
+
+```bash
+$CAMERA_FLOW_STORE_DIR/video/YYYY-MM-DD/
+```
+
+SQLite 里的视频索引表为：
+
+- `video_segments`
+
+常用查看命令：
+
+```bash
+sqlite3 /media/elf/2461-4BDA/flow/offline.db "SELECT id, start_ms, end_ms, size_bytes, state, file_path FROM video_segments ORDER BY id DESC LIMIT 10;"
+```
+
+### 7. 离线缓存逻辑
 
 本地缓存由 `local_store.c/.h` 提供，底层使用 SQLite。
 
@@ -126,7 +161,7 @@ SQLite 表当前保存：
 - `payload` 直接保存最终 MQTT JSON，恢复联网后可以原样补发
 - `media_type/media_path` 先预留给后续视频或图片文件索引
 
-### 7. SQLite 运行策略
+### 8. SQLite 运行策略
 
 当前数据库初始化时会设置：
 
@@ -268,7 +303,43 @@ sqlite3 /media/elf/2461-4BDA/flow/offline.db "SELECT id, created_at_ms, topic FR
 
 日志里打印出的路径，就是当前程序实际使用的数据库路径。
 
-### 3. 断网恢复测试建议
+### 3. 视频断网转存测试
+
+当前已经提供一个最小测试接口，使用环境变量触发模拟 RTMP 运行中断开：
+
+```bash
+export CAMERA_FLOW_STORE_DIR=/media/elf/2461-4BDA/flow
+export CAMERA_FLOW_VIDEO_SEGMENT_MS=5000
+export CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES=60
+./main
+```
+
+推荐这样理解这几个环境变量：
+
+- `CAMERA_FLOW_STORE_DIR`
+  - 指定 SQLite 和视频文件根目录
+- `CAMERA_FLOW_VIDEO_SEGMENT_MS=5000`
+  - 把分片时长临时改成 5 秒，方便快速观察轮转
+- `CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES=60`
+  - 子进程在 RTMP 模式下处理到第 60 帧时，主动模拟一次 RTMP 断开
+
+测试时你应该观察到：
+
+- 日志出现：
+  - `[Child] Debug: simulate RTMP disconnect ...`
+  - `[Child] RTMP push failed, switch to local file mode.`
+  - `[Child] Local segment started: ...`
+- SD 卡目录里出现 `.ts` 文件
+- `video_segments` 表里出现新纪录
+
+可用下面两组命令观察：
+
+```bash
+find /media/elf/2461-4BDA/flow/video -type f -name '*.ts' | sort
+sqlite3 /media/elf/2461-4BDA/flow/offline.db "SELECT id, start_ms, end_ms, size_bytes, state, file_path FROM video_segments ORDER BY id DESC LIMIT 10;"
+```
+
+### 4. 断网恢复测试建议
 
 如果只是验证应用逻辑，优先用：
 
@@ -295,6 +366,7 @@ ip link set <wifi_if> up
 
 - 当前正式链路已经验证通过：断网时结构化数据会写入 SQLite，恢复联网后会自动补发，并在补发成功后删除离线记录。
 - 当前 RTMP 正式链路已经改成：推流断开时子进程可以退出，但父进程不会因为 `send_fd/ack` 失败直接结束，而是继续采集并按指数退避策略重启推流子进程。
+- 当前视频断网转存最小闭环已经接通：RTMP 失败后会切到本地 `.ts` 分片，并在 SQLite 中登记 `video_segments` 索引。
 - 如果主程序日志里已经出现：
 
 ```text
@@ -311,7 +383,7 @@ ip link set <wifi_if> up
 ```
 
 - 当前正式能力只覆盖“结构化数据离线缓存和补发”，还不包括“视频文件本体离线缓存与补传”。
-- 当前 RTMP 恢复能力只覆盖“实时推流自动重连”，还不包括“断网期间视频片段落盘与后续补传”。
+- 当前 RTMP 恢复能力已经覆盖“实时推流自动重连 + 断网期间本地 `.ts` 转存”，但还不包括“历史视频片段补传到云端”。
 
 ## 构建
 
@@ -344,9 +416,10 @@ make mqtt_chain_debug
 - RTMP 写失败时推流子进程退出
 - 父进程在 RTMP 掉线后继续运行
 - 父进程按指数退避策略重启推流子进程
+- RTMP 失败后自动切到本地 `.ts` 分片
+- `video_segments` SQLite 索引登记
+- 按 3GB 左右容量上限自动清理旧片段
 
 还未正式接入的能力：
 
-- 视频文件本体落 SD 卡
-- 视频文件路径写入 `media_path`
 - 视频恢复联网后的文件级补传
