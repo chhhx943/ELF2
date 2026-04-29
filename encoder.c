@@ -11,19 +11,21 @@
 
 int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height, int fps)
 {
-    
+    const AVCodec *codec;
+    int ret;
+
     s->width = width;
     s->height = height;
     s->frame_pts = 0;
+
     avformat_alloc_output_context2(&s->fmt_ctx, NULL, "flv", filename);
     if (!s->fmt_ctx) {
         fprintf(stderr, "Could not allocate output context\n");
         return -1;
-    }   
+    }
 
-   AVCodec *codec = avcodec_find_encoder_by_name("h264_rkmpp");
-  // const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-   if (!codec) {
+    codec = avcodec_find_encoder_by_name("h264_rkmpp");
+    if (!codec) {
         fprintf(stderr, "Codec not found\n");
         return -1;
     }
@@ -43,19 +45,15 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     s->enc_ctx->width = width;
     s->enc_ctx->height = height;
     s->enc_ctx->time_base = (AVRational){1, fps};
-  //  s->enc_ctx->time_base = (AVRational){1, 1000000};
     s->enc_ctx->framerate = (AVRational){fps, 1};
     s->enc_ctx->gop_size = 10;
     s->enc_ctx->max_b_frames = 0;
     s->enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
-    s->enc_ctx->bit_rate = 1500000; // Adjust as needed
+    s->enc_ctx->bit_rate = 1500000;
 
-
-
-
-
-    if (s->fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+    if (s->fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
         s->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
 
     if (avcodec_open2(s->enc_ctx, codec, NULL) < 0) {
         fprintf(stderr, "Could not open codec\n");
@@ -66,19 +64,26 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
     s->sws_ctx = NULL;
 
     s->yuv_frame = av_frame_alloc();
+    if (!s->yuv_frame) {
+        fprintf(stderr, "Could not allocate frame\n");
+        return -1;
+    }
+
+    /*
+     * MPP/RGA Ëøô‰∏ÄÈìæÂØπÈ´òÂ∫¶ÂØπÈΩêÊØîËæÉÊïèÊÑüÔºåËøôÈáåÂÖàÊåâ 768 ÂàÜÈÖçÂ∏¶ÂØπÈΩêÁöÑÁºìÂÜ≤Ôºå
+     * ÂêéÈù¢ÁúüÊ≠£ÁºñÁ†ÅÊó∂ÂÜçÊää frame height ËÆæÂõû 720„ÄÇ
+     */
     s->yuv_frame->format = AV_PIX_FMT_NV12;
     s->yuv_frame->width = width;
     s->yuv_frame->height = 768;
-    
-    
+
     if (av_frame_get_buffer(s->yuv_frame, 64) < 0) {
         fprintf(stderr, "Could not allocate frame data.\n");
         return -1;
     }
 
-
     s->yuv_frame->height = height;
-   
+
     if (!(s->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&s->fmt_ctx->pb, filename, AVIO_FLAG_WRITE) < 0) {
             fprintf(stderr, "Could not open output file\n");
@@ -86,51 +91,75 @@ int streamer_init(FFmpegStreamer *s, const char *filename, int width, int height
         }
     }
 
-    avformat_write_header(s->fmt_ctx, NULL);      
+    ret = avformat_write_header(s->fmt_ctx, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Could not write stream header: %d\n", ret);
+        return -1;
+    }
+
     return 0;
 }
 
 int streamer_push(FFmpegStreamer *s, uint8_t *nv12_data)
 {
+    int ret;
+    AVPacket *pkt = av_packet_alloc();
+
+    if (!pkt) {
+        return -1;
+    }
 
     s->yuv_frame->data[0] = nv12_data;
     s->yuv_frame->linesize[0] = s->width;
     s->yuv_frame->data[1] = nv12_data + s->width * s->height;
     s->yuv_frame->linesize[1] = s->width;
     s->yuv_frame->pts = s->frame_pts++;
-    AVPacket *pkt = av_packet_alloc();
 
-    int ret = avcodec_send_frame(s->enc_ctx, s->yuv_frame);
+    ret = avcodec_send_frame(s->enc_ctx, s->yuv_frame);
     if (ret < 0) {
         fprintf(stderr, "Error sending frame to encoder\n");
+        av_packet_free(&pkt);
         return -1;
     }
 
     while (ret >= 0) {
         ret = avcodec_receive_packet(s->enc_ctx, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             break;
-        else if (ret < 0) {
+        } else if (ret < 0) {
             fprintf(stderr, "Error encoding frame\n");
+            av_packet_free(&pkt);
             return -1;
         }
+
         av_packet_rescale_ts(pkt, s->enc_ctx->time_base, s->video_st->time_base);
         pkt->stream_index = s->video_st->index;
-        av_interleaved_write_frame(s->fmt_ctx, pkt);
+
+        ret = av_interleaved_write_frame(s->fmt_ctx, pkt);
+        if (ret < 0) {
+            fprintf(stderr, "RTMP write failed: %d\n", ret);
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
+            return -1;
+        }
+
         av_packet_unref(pkt);
     }
+
     av_packet_free(&pkt);
     return 0;
 }
 
 int streamer_push_zerocopy(FFmpegStreamer *s, int dma_fd) {
     int ret;
+    AVPacket *pkt;
+    rga_buffer_t src;
+    rga_buffer_t dst;
+    im_rect src_rect;
+    im_rect dst_rect;
+    IM_STATUS status;
 
-    // =======================================================
-    // 1. ”≤º˛º∂ ˝æ›∞·‘À (RGA ÕÍ»´Ω”π‹ƒ⁄¥Ê∂‘∆Î)
-    // =======================================================
-
-
+    /* ÂÖàÁî® RGA Êää V4L2 ÂØºÂá∫ÁöÑ DMA-BUF Êã∑Ëøõ FFmpeg ÁöÑÂØπÈΩêÁºìÂÜ≤ÔºåÂÜçÈÄÅÁªôÁºñÁ†ÅÂô®„ÄÇ */
     if (dma_fd <= 0) {
         fprintf(stderr, "Invalid dma_fd: %d\n", dma_fd);
         return -1;
@@ -139,87 +168,80 @@ int streamer_push_zerocopy(FFmpegStreamer *s, int dma_fd) {
         fprintf(stderr, "AVFrame data[0] is NULL!\n");
         return -1;
     }
-    
+
     s->yuv_frame->height = 768;
-    // »∑±£ AVFrame µƒƒ⁄≤øª∫¥Ê“—±ª∑÷≈‰«“¥¶”⁄ø…–¥◊¥Ã¨
-    av_frame_make_writable(s->yuv_frame);
-
-    // ??  B£∫…Í«ÎÕÍƒ⁄¥Ê∫Û£¨¡¢øÃ∞—∏ﬂ∂»∏ƒªÿ 720£¨∏¯∫Û√Êµƒ±‡¬Î∆˜ø¥
+    ret = av_frame_make_writable(s->yuv_frame);
+    if (ret < 0) {
+        fprintf(stderr, "Frame is not writable: %d\n", ret);
+        return -1;
+    }
     s->yuv_frame->height = 720;
-   
 
-
-    // 1a. ≈‰÷√ RGA ‘¥£∫∞Û∂® V4L2 µ◊≤„Õ¬≥ˆµƒ¥øæªŒÔ¿Ìƒ⁄¥Ê (Œﬁ Padding)
-    // dma_fd: V4L2 µº≥ˆµƒΩ‘ø≥◊
-    // RK_FORMAT_YCbCr_420_SP: RGA ¿Ô∂‘ NV12 ∏Ò Ωµƒ≥∆∫Ù
-    rga_buffer_t src = wrapbuffer_fd(dma_fd, s->width, s->height, RK_FORMAT_YCbCr_420_SP);
+    src = wrapbuffer_fd(dma_fd, s->width, s->height, RK_FORMAT_YCbCr_420_SP);
     src.wstride = s->width;
-    src.hstride = s->height; // V4L2 ’Ê µ∏ﬂ∂» (¿˝»Á 720)
+    src.hstride = s->height;
 
-    // 1b. ≈‰÷√ RGA ƒø±Í£∫∞Û∂® FFmpeg ¥¯”– 64 ◊÷Ω⁄≤π∆Îµƒ–Èƒ‚ƒ⁄¥Ê
-    rga_buffer_t dst = wrapbuffer_virtualaddr(s->yuv_frame->data[0], s->width, s->height, RK_FORMAT_YCbCr_420_SP);
-    dst.wstride = s->yuv_frame->linesize[0]; 
-    dst.hstride = 768; // ?? ƒß∑®∫À–ƒ£∫«ø÷∆÷∏∂®ƒø±ÍŒÔ¿Ì∏ﬂ∂»Œ™ 768£¨¬˙◊„ MPP µƒ∂‘∆ÎÒ±∫√
-    
-    im_rect src_rect = {0, 0, s->width, s->height};
-    im_rect dst_rect = {0, 0, s->width, s->height};
+    dst = wrapbuffer_virtualaddr(s->yuv_frame->data[0], s->width, s->height, RK_FORMAT_YCbCr_420_SP);
+    dst.wstride = s->yuv_frame->linesize[0];
+    dst.hstride = 768;
 
-    rga_buffer_t pat = {0};
-    im_rect pat_rect = {0};
-    // 1c. ∫ÙΩ– RGA ”≤º˛÷¥–– 2D øΩ±¥£®À≤º‰ÕÍ≥…£¨CPU ¡„∏…‘§£©
-    IM_STATUS status = improcess(src, dst, (rga_buffer_t){0}, src_rect, dst_rect, (im_rect){0}, IM_SYNC);
- //   IM_STATUS status = imcopy(src, dst);
+    src_rect = (im_rect){0, 0, s->width, s->height};
+    dst_rect = (im_rect){0, 0, s->width, s->height};
+
+    status = improcess(src, dst, (rga_buffer_t){0}, src_rect, dst_rect, (im_rect){0}, IM_SYNC);
     if (status != IM_STATUS_SUCCESS) {
-        fprintf(stderr, "RGA Copy failed: %s\n", imStrError(status));
+        fprintf(stderr, "RGA copy failed: %s\n", imStrError(status));
         return -1;
     }
 
-    s->yuv_frame->data[1] = s->yuv_frame->data[0] + (1280 * 768);
-    s->yuv_frame->linesize[1] = 1280; // »∑±£øÁæ‡“ª÷¬
-    // =======================================================
-    // 2. ¥Ú…œ¿ÌœÎ ±º‰¥¡ (∏ß∆ΩŒÔ¿Ì∂∂∂Ø£¨±£÷§≤•∑≈∆˜Àøª¨)
-    // =======================================================
-    // «ø––∞¥ÕÍ√¿µ»≤Ó ˝¡–µ›‘ˆ£¨≈‰∫œÕ∆¡˜–≠“ÈµƒπÃ∂®÷°¬ “™«Û
+    s->yuv_frame->data[1] = s->yuv_frame->data[0] + (s->width * 768);
+    s->yuv_frame->linesize[1] = s->width;
     s->yuv_frame->pts = s->frame_pts++;
 
-    // =======================================================
-    // 3. Ω´◊È◊∞∫√µƒÕÍ√¿÷°£¨Œπ∏¯ MPP ”≤º˛±‡¬Î∆˜
-    // =======================================================
     ret = avcodec_send_frame(s->enc_ctx, s->yuv_frame);
     if (ret < 0) {
         fprintf(stderr, "Error sending frame to hardware encoder\n");
         return ret;
     }
 
-    // =======================================================
-    // 4. —≠ª∑Ω” ’—πÀı∫√µƒ H.264  ˝æ›∞¸≤¢Õ∆¡˜
-    // =======================================================
-    AVPacket *pkt = av_packet_alloc();
+    pkt = av_packet_alloc();
+    if (!pkt) {
+        return -1;
+    }
+
     while (1) {
         ret = avcodec_receive_packet(s->enc_ctx, pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-            break; // ”≤º˛Àµ£∫ªπ√ª—π∫√£¨ªÚ’ﬂΩ· ¯¡À
+            break;
         } else if (ret < 0) {
             fprintf(stderr, "Error receiving packet from hardware encoder\n");
-            break;
+            av_packet_free(&pkt);
+            return -1;
         }
 
-        //  ±º‰ª˘◊™ªª£∫¥”±‡¬Î∆˜µƒ ±÷”◊™µΩ RTMP/FLV µƒ ±÷”
         av_packet_rescale_ts(pkt, s->enc_ctx->time_base, s->video_st->time_base);
         pkt->stream_index = s->video_st->index;
 
-        // ∑¢ÀÕ∏¯ Nginx-RTMP ∑˛ŒÒ∆˜
-        av_interleaved_write_frame(s->fmt_ctx, pkt);
-        av_packet_unref(pkt); // ±ÿ–Î unref ∑¿÷πƒ⁄¥Ê–π¬©
-    }
-    av_packet_free(&pkt);
+        ret = av_interleaved_write_frame(s->fmt_ctx, pkt);
+        if (ret < 0) {
+            fprintf(stderr, "RTMP write failed: %d\n", ret);
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
+            return -1;
+        }
 
+        av_packet_unref(pkt);
+    }
+
+    av_packet_free(&pkt);
     return 0;
 }
 
 int streamer_clean(FFmpegStreamer *s)
 {
-    if (!s) return -1;
+    if (!s) {
+        return -1;
+    }
     if (s->fmt_ctx) {
         av_write_trailer(s->fmt_ctx);
     }
