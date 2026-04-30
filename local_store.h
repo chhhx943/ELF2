@@ -42,8 +42,12 @@ typedef struct {
     int64_t end_ms;
     int64_t size_bytes;
     int64_t created_at_ms;
+    int retry_count;
+    int64_t uploaded_at_ms;
     char file_path[LOCAL_STORE_MAX_MEDIA_PATH_LEN];
     char state[LOCAL_STORE_MAX_SEGMENT_STATE_LEN];
+    char last_error[LOCAL_STORE_MAX_PAYLOAD_LEN];
+    char remote_path[LOCAL_STORE_MAX_MEDIA_PATH_LEN];
 } LocalVideoSegmentRecord;
 
 int local_store_open(LocalStore *store, const char *root_dir);
@@ -79,7 +83,24 @@ int local_store_delete_video_segment(LocalStore *store, int64_t segment_id);
 int local_store_fetch_oldest_prunable_video_segment(LocalStore *store,
                                                     LocalVideoSegmentRecord *record,
                                                     int *found_out);
+int local_store_fetch_oldest_pending_video_segment(LocalStore *store,
+                                                   LocalVideoSegmentRecord *record,
+                                                   int *found_out);
 int local_store_video_total_size(LocalStore *store, int64_t *bytes_out);
+int local_store_mark_video_segment_uploading(LocalStore *store, int64_t segment_id);
+int local_store_mark_video_segment_uploaded(LocalStore *store,
+                                            int64_t segment_id,
+                                            const char *remote_path,
+                                            int64_t uploaded_at_ms);
+int local_store_mark_video_segment_retry(LocalStore *store,
+                                         int64_t segment_id,
+                                         const char *last_error);
+int local_store_reset_uploading_video_segments(LocalStore *store);
+int local_store_debug_fetch_video_segment_by_id(LocalStore *store,
+                                                int64_t id,
+                                                LocalVideoSegmentRecord *record,
+                                                int *found_out);
+int local_store_debug_dump_video_segments(const char *root_dir, int limit);
 
 int local_store_debug_selftest(const char *root_dir);
 int local_store_debug_dump(const char *root_dir, int limit);

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -15,6 +16,7 @@
 // 本地离线队列是一个轻量 SQLite 单文件库，放在 SD 卡上做断网缓存。
 #define LOCAL_STORE_DB_NAME "offline.db"
 #define LOCAL_STORE_MAX_ROWS 100000
+#define LOCAL_STORE_INIT_LOCK_NAME ".offline.db.init.lock"
 
 static int local_store_copy_string(char *dst, size_t dst_size, const char *src) {
     if (dst == NULL || dst_size == 0) {
@@ -74,6 +76,42 @@ static int local_store_mkdirs(const char *path) {
     return 0;
 }
 
+static int local_store_open_init_lock(const char *root_dir, char *lock_path, size_t lock_path_size) {
+    int fd;
+    int rc;
+
+    if (root_dir == NULL || lock_path == NULL || lock_path_size == 0) {
+        return -1;
+    }
+
+    rc = snprintf(lock_path, lock_path_size, "%s/%s", root_dir, LOCAL_STORE_INIT_LOCK_NAME);
+    if (rc < 0 || (size_t)rc >= lock_path_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    fd = open(lock_path, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (flock(fd, LOCK_EX) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+static void local_store_close_init_lock(int fd) {
+    if (fd < 0) {
+        return;
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
+}
+
 static int local_store_exec(LocalStore *store, const char *sql) {
     char *errmsg = NULL;
     int rc;
@@ -116,17 +154,25 @@ static void local_store_fill_record(sqlite3_stmt *stmt, LocalStoreRecord *record
 static void local_store_fill_video_segment_record(sqlite3_stmt *stmt, LocalVideoSegmentRecord *record) {
     const unsigned char *file_path;
     const unsigned char *state;
+    const unsigned char *last_error;
+    const unsigned char *remote_path;
 
     record->id = sqlite3_column_int64(stmt, 0);
     record->start_ms = sqlite3_column_int64(stmt, 1);
     record->end_ms = sqlite3_column_int64(stmt, 2);
     record->size_bytes = sqlite3_column_int64(stmt, 3);
-    state = sqlite3_column_text(stmt, 4);
-    file_path = sqlite3_column_text(stmt, 5);
-    record->created_at_ms = sqlite3_column_int64(stmt, 6);
+    record->retry_count = sqlite3_column_int(stmt, 4);
+    record->uploaded_at_ms = sqlite3_column_int64(stmt, 5);
+    state = sqlite3_column_text(stmt, 6);
+    file_path = sqlite3_column_text(stmt, 7);
+    record->created_at_ms = sqlite3_column_int64(stmt, 8);
+    last_error = sqlite3_column_text(stmt, 9);
+    remote_path = sqlite3_column_text(stmt, 10);
 
     local_store_copy_string(record->state, sizeof(record->state), (const char *)state);
     local_store_copy_string(record->file_path, sizeof(record->file_path), (const char *)file_path);
+    local_store_copy_string(record->last_error, sizeof(record->last_error), (const char *)last_error);
+    local_store_copy_string(record->remote_path, sizeof(record->remote_path), (const char *)remote_path);
 }
 
 static int64_t local_store_now_ms(void) {
@@ -199,8 +245,12 @@ static int local_store_init_schema(LocalStore *store) {
         "start_ms INTEGER NOT NULL,"
         "end_ms INTEGER NOT NULL DEFAULT 0,"
         "size_bytes INTEGER NOT NULL DEFAULT 0,"
+        "retry_count INTEGER NOT NULL DEFAULT 0,"
+        "uploaded_at_ms INTEGER NOT NULL DEFAULT 0,"
         "state TEXT NOT NULL,"
         "file_path TEXT NOT NULL,"
+        "last_error TEXT NOT NULL DEFAULT '',"
+        "remote_path TEXT NOT NULL DEFAULT '',"
         "created_at_ms INTEGER NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_offline_queue_created_at "
@@ -211,6 +261,84 @@ static int local_store_init_schema(LocalStore *store) {
         "ON video_segments(state);";
 
     return local_store_exec(store, kSchemaSql);
+}
+
+static int local_store_column_exists(LocalStore *store,
+                                     const char *table_name,
+                                     const char *column_name,
+                                     int *exists_out) {
+    sqlite3_stmt *stmt = NULL;
+    char sql[128];
+    int rc;
+
+    if (store == NULL || store->db == NULL || table_name == NULL || column_name == NULL || exists_out == NULL) {
+        return EINVAL;
+    }
+
+    rc = snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table_name);
+    if (rc < 0 || (size_t)rc >= sizeof(sql)) {
+        return ENAMETOOLONG;
+    }
+
+    rc = sqlite3_prepare_v2(store->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    *exists_out = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 1);
+        if (name != NULL && strcmp((const char *)name, column_name) == 0) {
+            *exists_out = 1;
+            break;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+static int local_store_ensure_video_segments_columns(LocalStore *store) {
+    struct ColumnPatch {
+        const char *name;
+        const char *sql;
+    };
+    static const struct ColumnPatch patches[] = {
+        { "retry_count", "ALTER TABLE video_segments ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;" },
+        { "uploaded_at_ms", "ALTER TABLE video_segments ADD COLUMN uploaded_at_ms INTEGER NOT NULL DEFAULT 0;" },
+        { "last_error", "ALTER TABLE video_segments ADD COLUMN last_error TEXT NOT NULL DEFAULT '';" },
+        { "remote_path", "ALTER TABLE video_segments ADD COLUMN remote_path TEXT NOT NULL DEFAULT '';" },
+    };
+    int exists = 0;
+    int exists_after = 0;
+    int rc;
+
+    for (size_t i = 0; i < sizeof(patches) / sizeof(patches[0]); ++i) {
+        rc = local_store_column_exists(store, "video_segments", patches[i].name, &exists);
+        if (rc != 0) {
+            return rc;
+        }
+        if (!exists) {
+            rc = local_store_exec(store, patches[i].sql);
+            if (rc != 0) {
+                // 多进程/多线程同时启动时，另一方可能刚好先一步把列补上。
+                // 这里复查一次当前列是否已经存在，存在就把这次迁移视为成功。
+                rc = local_store_column_exists(store, "video_segments", patches[i].name, &exists_after);
+                if (rc != 0) {
+                    return rc;
+                }
+                if (!exists_after) {
+                    return EIO;
+                }
+            }
+        }
+    }
+
+    return 0;
 }
 
 static int local_store_prune(LocalStore *store) {
@@ -259,6 +387,8 @@ static int local_store_prune(LocalStore *store) {
 
 int local_store_open(LocalStore *store, const char *root_dir) {
     const char *effective_root = root_dir;
+    char lock_path[PATH_MAX];
+    int lock_fd = -1;
     int rc;
 
     if (store == NULL) {
@@ -285,12 +415,19 @@ int local_store_open(LocalStore *store, const char *root_dir) {
         return ENAMETOOLONG;
     }
 
+    lock_fd = local_store_open_init_lock(effective_root, lock_path, sizeof(lock_path));
+    if (lock_fd < 0) {
+        rc = errno != 0 ? errno : EIO;
+        return rc;
+    }
+
     rc = sqlite3_open(store->db_path, &store->db);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "[LocalStore] sqlite open failed: %s\n",
                 store->db != NULL ? sqlite3_errmsg(store->db) : "unknown");
         local_store_close(store);
-        return EIO;
+        rc = EIO;
+        goto unlock_and_exit;
     }
 
     sqlite3_busy_timeout(store->db, 1000);
@@ -299,22 +436,30 @@ int local_store_open(LocalStore *store, const char *root_dir) {
     rc = local_store_exec(store, "PRAGMA journal_mode=WAL;");
     if (rc != 0) {
         local_store_close(store);
-        return rc;
+        goto unlock_and_exit;
     }
 
     rc = local_store_exec(store, "PRAGMA synchronous=NORMAL;");
     if (rc != 0) {
         local_store_close(store);
-        return rc;
+        goto unlock_and_exit;
     }
 
     rc = local_store_init_schema(store);
     if (rc != 0) {
         local_store_close(store);
-        return rc;
+        goto unlock_and_exit;
     }
 
-    return 0;
+    rc = local_store_ensure_video_segments_columns(store);
+    if (rc != 0) {
+        local_store_close(store);
+        goto unlock_and_exit;
+    }
+
+unlock_and_exit:
+    local_store_close_init_lock(lock_fd);
+    return rc;
 }
 
 void local_store_close(LocalStore *store) {
@@ -580,9 +725,51 @@ int local_store_fetch_oldest_prunable_video_segment(LocalStore *store,
 
     rc = sqlite3_prepare_v2(
         store->db,
-        "SELECT id, start_ms, end_ms, size_bytes, state, file_path, created_at_ms "
+        "SELECT id, start_ms, end_ms, size_bytes, retry_count, uploaded_at_ms, "
+        "state, file_path, created_at_ms, last_error, remote_path "
         "FROM video_segments "
         "WHERE state IN ('uploaded', 'pending', 'broken') "
+        "ORDER BY start_ms ASC LIMIT 1;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        local_store_fill_video_segment_record(stmt, record);
+        *found_out = 1;
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    *found_out = 0;
+    return 0;
+}
+
+int local_store_fetch_oldest_pending_video_segment(LocalStore *store,
+                                                   LocalVideoSegmentRecord *record,
+                                                   int *found_out) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL || record == NULL || found_out == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "SELECT id, start_ms, end_ms, size_bytes, retry_count, uploaded_at_ms, "
+        "state, file_path, created_at_ms, last_error, remote_path "
+        "FROM video_segments "
+        "WHERE state = 'pending' "
         "ORDER BY start_ms ASC LIMIT 1;",
         -1,
         &stmt,
@@ -635,6 +822,226 @@ int local_store_video_total_size(LocalStore *store, int64_t *bytes_out) {
 
     *bytes_out = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
+    return 0;
+}
+
+int local_store_mark_video_segment_uploading(LocalStore *store, int64_t segment_id) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "UPDATE video_segments SET state = 'uploading' WHERE id = ?;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_int64(stmt, 1, segment_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+int local_store_mark_video_segment_uploaded(LocalStore *store,
+                                            int64_t segment_id,
+                                            const char *remote_path,
+                                            int64_t uploaded_at_ms) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "UPDATE video_segments "
+        "SET state = 'uploaded', uploaded_at_ms = ?, remote_path = ?, last_error = '' "
+        "WHERE id = ?;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_int64(stmt, 1, uploaded_at_ms);
+    sqlite3_bind_text(stmt, 2, remote_path != NULL ? remote_path : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, segment_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+int local_store_mark_video_segment_retry(LocalStore *store,
+                                         int64_t segment_id,
+                                         const char *last_error) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "UPDATE video_segments "
+        "SET state = 'pending', retry_count = retry_count + 1, last_error = ? "
+        "WHERE id = ?;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_text(stmt, 1, last_error != NULL ? last_error : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, segment_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+int local_store_reset_uploading_video_segments(LocalStore *store) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "UPDATE video_segments SET state = 'pending' WHERE state = 'uploading';",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    return 0;
+}
+
+int local_store_debug_fetch_video_segment_by_id(LocalStore *store,
+                                                int64_t id,
+                                                LocalVideoSegmentRecord *record,
+                                                int *found_out) {
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (store == NULL || store->db == NULL || record == NULL || found_out == NULL) {
+        return EINVAL;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store->db,
+        "SELECT id, start_ms, end_ms, size_bytes, retry_count, uploaded_at_ms, "
+        "state, file_path, created_at_ms, last_error, remote_path "
+        "FROM video_segments WHERE id = ?;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        return EIO;
+    }
+
+    sqlite3_bind_int64(stmt, 1, id);
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        local_store_fill_video_segment_record(stmt, record);
+        *found_out = 1;
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return EIO;
+    }
+
+    *found_out = 0;
+    return 0;
+}
+
+int local_store_debug_dump_video_segments(const char *root_dir, int limit) {
+    LocalStore store;
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+    int count = 0;
+
+    if (limit <= 0) {
+        limit = 10;
+    }
+
+    memset(&store, 0, sizeof(store));
+    rc = local_store_open(&store, root_dir);
+    if (rc != 0) {
+        return rc;
+    }
+
+    rc = sqlite3_prepare_v2(
+        store.db,
+        "SELECT id, start_ms, end_ms, size_bytes, retry_count, uploaded_at_ms, "
+        "state, file_path, created_at_ms, last_error, remote_path "
+        "FROM video_segments ORDER BY id DESC LIMIT ?;",
+        -1,
+        &stmt,
+        NULL);
+    if (rc != SQLITE_OK) {
+        local_store_close(&store);
+        return EIO;
+    }
+
+    sqlite3_bind_int(stmt, 1, limit);
+    printf("[LocalStoreVideoDump] db path: %s\n", store.db_path);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        LocalVideoSegmentRecord record;
+        memset(&record, 0, sizeof(record));
+        local_store_fill_video_segment_record(stmt, &record);
+        printf("[LocalStoreVideoDump] row[%d] id=%lld state=%s retry=%d size=%lld path=%s remote=%s err=%s\n",
+               count,
+               (long long)record.id,
+               record.state,
+               record.retry_count,
+               (long long)record.size_bytes,
+               record.file_path,
+               record.remote_path,
+               record.last_error);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    local_store_close(&store);
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        return EIO;
+    }
+
     return 0;
 }
 

@@ -4,6 +4,7 @@
 #include "sensor_modbus.h"
 #include "aliyun_mqtt.h"
 #include "video_store.h"
+#include "video_uploader.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -136,6 +137,65 @@ static int env_to_positive_int(const char *name, int fallback) {
     }
 
     return (int)parsed;
+}
+
+static int video_uploader_macro_ready(char *reason, size_t reason_size) {
+    int has_url = VIDEO_UPLOADER_HTTP_UPLOAD_URL[0] != '\0';
+    int has_token = VIDEO_UPLOADER_HTTP_AUTH_TOKEN[0] != '\0';
+    int has_device_id = VIDEO_UPLOADER_HTTP_DEVICE_ID[0] != '\0';
+    int offset = 0;
+    int rc;
+
+    if (reason != NULL && reason_size > 0) {
+        reason[0] = '\0';
+    }
+
+    if (has_url && has_token && has_device_id) {
+        return 1;
+    }
+
+    if (reason == NULL || reason_size == 0) {
+        return 0;
+    }
+
+    rc = snprintf(reason + offset, reason_size - (size_t)offset,
+                  "missing macro:");
+    if (rc < 0 || (size_t)rc >= reason_size - (size_t)offset) {
+        reason[reason_size - 1] = '\0';
+        return 0;
+    }
+    offset += rc;
+
+    if (!has_url && offset < (int)reason_size) {
+        rc = snprintf(reason + offset, reason_size - (size_t)offset,
+                      " VIDEO_UPLOADER_HTTP_UPLOAD_URL");
+        if (rc < 0 || (size_t)rc >= reason_size - (size_t)offset) {
+            reason[reason_size - 1] = '\0';
+            return 0;
+        }
+        offset += rc;
+    }
+
+    if (!has_token && offset < (int)reason_size) {
+        rc = snprintf(reason + offset, reason_size - (size_t)offset,
+                      " VIDEO_UPLOADER_HTTP_AUTH_TOKEN");
+        if (rc < 0 || (size_t)rc >= reason_size - (size_t)offset) {
+            reason[reason_size - 1] = '\0';
+            return 0;
+        }
+        offset += rc;
+    }
+
+    if (!has_device_id && offset < (int)reason_size) {
+        rc = snprintf(reason + offset, reason_size - (size_t)offset,
+                      " VIDEO_UPLOADER_HTTP_DEVICE_ID");
+        if (rc < 0 || (size_t)rc >= reason_size - (size_t)offset) {
+            reason[reason_size - 1] = '\0';
+            return 0;
+        }
+    }
+
+    return 0;
 }
 
 static void mark_stream_offline(StreamState *stream) {
@@ -335,8 +395,8 @@ static int child_stream_loop(int sock) {
     int child_fd;
     int ret;
 
-    signal(SIGINT, SIG_IGN);
-    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.rtmp_retry_backoff_ms = CHILD_RTMP_RETRY_BASE_MS;
@@ -369,7 +429,7 @@ static int child_stream_loop(int sock) {
         }
     }
 
-    while ((child_fd = recv_fd(sock)) >= 0) {
+    while (is_running && (child_fd = recv_fd(sock)) >= 0) {
         frame_ms = now_ms();
 
         if (ctx.mode == CHILD_OUTPUT_FILE) {
@@ -527,6 +587,11 @@ int main(void) {
     int shmid = -1;
     void *shmaddr = (void *)-1;
     int dma_fds[BUF_COUNT] = { -1, -1, -1, -1 };
+    VideoUploader video_uploader;
+    int video_uploader_started = 0;
+    char video_uploader_reason[256];
+
+    memset(&video_uploader, 0, sizeof(video_uploader));
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -586,6 +651,13 @@ int main(void) {
     }
 
     {
+        int rc = spawn_stream_child(&stream);
+        if (rc < 0) {
+            printf("[Parent] Initial stream child start failed, continue in offline mode.\n");
+        }
+    }
+
+    {
         int rc = start_mqtt_reporter();
         if (rc != 0) {
             fprintf(stderr, "[Parent] Failed to start MQTT reporter: %s\n", strerror(rc));
@@ -594,7 +666,22 @@ int main(void) {
         }
     }
 
-    if (spawn_stream_child(&stream) < 0) {
+    if (video_uploader_macro_ready(video_uploader_reason, sizeof(video_uploader_reason))) {
+        int rc = video_uploader_start(&video_uploader,
+                                      NULL,
+                                      video_uploader_http_upload_callback,
+                                      NULL);
+        if (rc != 0) {
+            fprintf(stderr, "[Parent] Failed to start video uploader: %s\n", strerror(rc));
+        } else {
+            video_uploader_started = 1;
+            printf("[Parent] Video uploader started\n");
+        }
+    } else {
+        printf("[Parent] Video uploader skipped: %s\n", video_uploader_reason);
+    }
+
+    if (stream.child_pid < 0) {
         printf("[Parent] Initial stream child start failed, continue in offline mode.\n");
     }
 
@@ -648,6 +735,9 @@ cleanup:
     is_running = 0;
     stop_mqtt_reporter();
     stop_stream_child(&stream);
+    if (video_uploader_started) {
+        video_uploader_stop(&video_uploader);
+    }
 
     camera_stop(&cam);
     camera_deinit(&cam);

@@ -20,11 +20,13 @@
 
 - `start_sensor_collector(...)`
 - `start_mqtt_reporter()`
+- `video_uploader_start(...)`（仅当 `video_uploader.h` 里的上传宏配置齐全时）
 - `spawn_stream_child(...)`
 
 退出时会调用：
 
 - `stop_mqtt_reporter()`
+- `video_uploader_stop(...)`
 - `stop_stream_child(...)`
 
 ### 2. 传感器链路
@@ -122,13 +124,48 @@ SQLite 里的视频索引表为：
 
 - `video_segments`
 
+### 7. 视频补传正式行为
+
+`video_uploader.c` 当前已经正式接入 `main.c` 的父进程生命周期。
+
+行为如下：
+
+- 主程序启动后，会检查 `video_uploader.h` 中以下宏是否为空
+  - `VIDEO_UPLOADER_HTTP_UPLOAD_URL`
+  - `VIDEO_UPLOADER_HTTP_AUTH_TOKEN`
+  - `VIDEO_UPLOADER_HTTP_DEVICE_ID`
+- 三个宏都非空时，父进程会启动后台 `video_uploader` 线程
+- 线程会从 `video_segments` 表中按时间顺序抓取 `state='pending'` 的片段
+- 上传成功后，把该片段状态更新为 `uploaded`
+- 上传失败后，把状态改回 `pending`，并增加 `retry_count`
+- 如果宏配置不完整，主程序不会退出，而是打印 `Video uploader skipped: ...` 后继续跑采集、RTMP、传感器、MQTT 主链路
+
+当前 HTTP 上传回调会用 `multipart/form-data` 发送：
+
+- `device_id`
+- `segment_id`
+- `start_ms`
+- `end_ms`
+- `size_bytes`
+- `file`
+
+并带请求头：
+
+- `Authorization: Bearer VIDEO_UPLOADER_HTTP_AUTH_TOKEN`
+
+服务端返回值当前要求：
+
+- HTTP 状态码 `200`
+- JSON 中 `code=0`
+- JSON 中包含 `remote_path`
+
 常用查看命令：
 
 ```bash
 sqlite3 /media/elf/2461-4BDA/flow/offline.db "SELECT id, start_ms, end_ms, size_bytes, state, file_path FROM video_segments ORDER BY id DESC LIMIT 10;"
 ```
 
-### 7. 离线缓存逻辑
+### 8. 离线缓存逻辑
 
 本地缓存由 `local_store.c/.h` 提供，底层使用 SQLite。
 
@@ -161,7 +198,7 @@ SQLite 表当前保存：
 - `payload` 直接保存最终 MQTT JSON，恢复联网后可以原样补发
 - `media_type/media_path` 先预留给后续视频或图片文件索引
 
-### 8. SQLite 运行策略
+### 9. SQLite 运行策略
 
 当前数据库初始化时会设置：
 
@@ -239,7 +276,72 @@ make mqtt_chain_debug
 - `full-test`
   - 连续执行一次完整闭环验证
 
-### 3. 调试接口
+### 3. `video_uploader_debug`
+
+用途：
+
+- 单独验证视频片段补传线程
+- 支持本地 mock 上传和真实 HTTP 上传两种模式
+
+构建：
+
+```bash
+make video_uploader_debug
+```
+
+用法：
+
+```bash
+./video_uploader_debug mock [root_dir]
+./video_uploader_debug http [root_dir]
+```
+
+说明：
+
+- `mock`
+  - 不访问网络
+  - 把待上传分片复制到 `root_dir/uploaded_mock/`
+  - 默认会模拟一次瞬时失败，验证自动重试
+
+- `http`
+  - 调用真实的 `video_uploader_http_upload_callback(...)`
+  - 会发起 multipart HTTP 上传
+  - 使用 `video_uploader.h` 中写死的上传宏配置
+
+本地联调用法：
+
+```bash
+make video_uploader_debug
+./video_uploader_debug http /tmp/video_uploader_http_test
+```
+
+正常情况下应看到：
+
+- 控制台打印 `[VideoUploader] Uploaded segment ...`
+- `video_segments.state` 变成 `uploaded`
+- `remote_path` 被回写进 SQLite
+
+可用下面命令检查：
+
+```bash
+sqlite3 /tmp/video_uploader_http_test/offline.db "SELECT id, state, retry_count, remote_path, last_error FROM video_segments ORDER BY id;"
+```
+
+如果只是先验证服务端 API，也可以直接用 curl：
+
+```bash
+printf 'test\n' > /tmp/test.ts
+curl -F "device_id=0122" \
+     -F "segment_id=1" \
+     -F "start_ms=1777600000000" \
+     -F "end_ms=1777600030000" \
+     -F "size_bytes=5" \
+     -F "file=@/tmp/test.ts" \
+     -H "Authorization: Bearer CHANGE_ME_TOKEN" \
+     http://127.0.0.1/api/video/upload
+```
+
+### 4. 调试接口
 
 `aliyun_mqtt.h` 当前还暴露了以下测试接口：
 
@@ -323,6 +425,8 @@ export CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES=60
 - `CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES=60`
   - 子进程在 RTMP 模式下处理到第 60 帧时，主动模拟一次 RTMP 断开
 
+如果还要顺带验证历史视频片段补传，先改好 `video_uploader.h` 里的上传宏配置，这样 `main` 中的 `video_uploader` 线程会自动启动并补传 `pending` 片段。
+
 测试时你应该观察到：
 
 - 日志出现：
@@ -367,6 +471,7 @@ ip link set <wifi_if> up
 - 当前正式链路已经验证通过：断网时结构化数据会写入 SQLite，恢复联网后会自动补发，并在补发成功后删除离线记录。
 - 当前 RTMP 正式链路已经改成：推流断开时子进程可以退出，但父进程不会因为 `send_fd/ack` 失败直接结束，而是继续采集并按指数退避策略重启推流子进程。
 - 当前视频断网转存最小闭环已经接通：RTMP 失败后会切到本地 `.ts` 分片，并在 SQLite 中登记 `video_segments` 索引。
+- 当前视频补传已经正式接进 `main.c`：上传宏配置齐全时，父进程会自动启动 `video_uploader` 线程。
 - 如果主程序日志里已经出现：
 
 ```text
@@ -382,8 +487,7 @@ ip link set <wifi_if> up
 模拟断网 -> 写 SQLite -> 恢复联网 -> MQTT 补发 -> 删除离线记录
 ```
 
-- 当前正式能力只覆盖“结构化数据离线缓存和补发”，还不包括“视频文件本体离线缓存与补传”。
-- 当前 RTMP 恢复能力已经覆盖“实时推流自动重连 + 断网期间本地 `.ts` 转存”，但还不包括“历史视频片段补传到云端”。
+- 当前视频补传能力依赖服务端 HTTP 接口可用；如果上传宏未配置，主程序会主动跳过这条链路。
 
 ## 构建
 
@@ -405,6 +509,12 @@ MQTT 离线补发全链路测试：
 make mqtt_chain_debug
 ```
 
+视频补传调试：
+
+```bash
+make video_uploader_debug
+```
+
 ## 当前状态
 
 已经验证通过的能力：
@@ -418,8 +528,10 @@ make mqtt_chain_debug
 - 父进程按指数退避策略重启推流子进程
 - RTMP 失败后自动切到本地 `.ts` 分片
 - `video_segments` SQLite 索引登记
+- `video_uploader` 自动补传 `pending` 视频片段
+- 上传成功后回写 `video_segments.state=uploaded`
 - 按 3GB 左右容量上限自动清理旧片段
 
-还未正式接入的能力：
+还需要继续完善的能力：
 
-- 视频恢复联网后的文件级补传
+- 服务端鉴权、存储、检索方案按实际部署继续收敛
