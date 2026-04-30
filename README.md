@@ -124,6 +124,21 @@ SQLite 里的视频索引表为：
 
 - `video_segments`
 
+关于片段时间戳，当前实现已经拆成两类时间源：
+
+- 单调时钟
+  - 只用于退避、轮转间隔、RTMP 恢复重试判断
+- 实时时钟
+  - 只用于本地 `.ts` 文件名、日期目录、`video_segments.start_ms/end_ms`
+
+这样可以避免把 `CLOCK_MONOTONIC` 误当成真实日历时间使用，导致本地分片目录落到 `1970-01-01`。
+
+补充说明：
+
+- 修复前历史数据如果已经写入过 `1970-01-01/seg_...ts`，这些旧记录会继续保留在 SQLite 中
+- 修复后新生成的分片，目录和文件名应恢复为真实日期
+- 如果发现“本地文件名正确，但服务端返回的 `remote_path` 文件名时间不一致”，优先检查服务端实际收到的 `file.filename`
+
 ### 7. 视频补传正式行为
 
 `video_uploader.c` 当前已经正式接入 `main.c` 的父进程生命周期。
@@ -436,11 +451,30 @@ export CAMERA_FLOW_DEBUG_RTMP_FAIL_AFTER_FRAMES=60
 - SD 卡目录里出现 `.ts` 文件
 - `video_segments` 表里出现新纪录
 
+如果时间戳修复已经生效，你应该看到新片段类似：
+
+```text
+/media/elf/2461-4BDA/flow/video/2026-04-30/seg_20260430_152358.ts
+```
+
+而不是：
+
+```text
+/media/elf/2461-4BDA/flow/video/1970-01-01/seg_19700101_....ts
+```
+
 可用下面两组命令观察：
 
 ```bash
 find /media/elf/2461-4BDA/flow/video -type f -name '*.ts' | sort
 sqlite3 /media/elf/2461-4BDA/flow/offline.db "SELECT id, start_ms, end_ms, size_bytes, state, file_path FROM video_segments ORDER BY id DESC LIMIT 10;"
+```
+
+如果还要进一步确认分片文件本身是否正常，可用：
+
+```bash
+ffprobe -v error -show_format -show_streams /media/elf/2461-4BDA/flow/video/2026-04-30/seg_xxx.ts
+ffmpeg -v warning -i /media/elf/2461-4BDA/flow/video/2026-04-30/seg_xxx.ts -f null -
 ```
 
 ### 4. 断网恢复测试建议
@@ -488,6 +522,8 @@ ip link set <wifi_if> up
 ```
 
 - 当前视频补传能力依赖服务端 HTTP 接口可用；如果上传宏未配置，主程序会主动跳过这条链路。
+- 当前新生成的视频分片已经按真实日期命名；如果数据库里还看到 `1970-01-01` 路径，通常是修复前留下的历史记录。
+- 如果“本地分片文件名正确，但服务端返回的 `remote_path` 文件名时间不一致”，优先排查服务端上传接口实际收到的 `file.filename`，再判断是否是服务端重命名逻辑问题。
 
 ## 构建
 

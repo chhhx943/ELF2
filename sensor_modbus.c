@@ -1,4 +1,5 @@
 #include "sensor_modbus.h"
+#include <poll.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -96,7 +97,8 @@ static void* sensor_thread_func(void* arg) {
         g_sensor_data.alarm_status = is_dangerous; 
         pthread_mutex_unlock(&g_sensor_data.lock);
 
-        usleep(500000); // 500ms 采集一?
+        // 用 poll 做可中断等待，避免 usleep 在收到信号时行为不够直观。
+        poll(NULL, 0, 500);
     }
     
     modbus_close(ctx);
