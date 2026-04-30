@@ -47,7 +47,7 @@ typedef struct {
     int max_restart_ms;
     int current_restart_ms;
     int restart_fail_count;
-    int64_t last_restart_ms;
+    int64_t last_restart_mono_ms;
 } StreamState;
 
 typedef enum {
@@ -66,12 +66,13 @@ typedef struct {
     int video_store_ready;
 
     int64_t current_segment_id;
-    int64_t current_segment_start_ms;
+    int64_t current_segment_start_wall_ms;
+    int64_t current_segment_start_mono_ms;
     char current_segment_path[PATH_MAX];
 
     int rtmp_retry_backoff_ms;
     int rtmp_retry_max_ms;
-    int64_t last_rtmp_retry_ms;
+    int64_t last_rtmp_retry_mono_ms;
 
     int debug_rtmp_fail_after_frames;
     int debug_rtmp_frame_count;
@@ -83,10 +84,20 @@ static void sig_handler(int sig) {
     is_running = 0;
 }
 
-static int64_t now_ms(void) {
+static int64_t mono_now_ms(void) {
     struct timespec ts;
 
     if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+        return 0;
+    }
+
+    return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static int64_t wall_now_ms(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) < 0) {
         return 0;
     }
 
@@ -214,7 +225,7 @@ static void mark_stream_offline(StreamState *stream) {
     }
 
     stream->stream_online = 0;
-    stream->last_restart_ms = now_ms();
+    stream->last_restart_mono_ms = mono_now_ms();
 }
 
 static void stop_stream_child(StreamState *stream) {
@@ -263,7 +274,7 @@ static int child_close_file_segment(ChildOutputCtx *ctx, int broken) {
         return 0;
     }
 
-    end_ms = now_ms();
+    end_ms = wall_now_ms();
     streamer_clean(&ctx->streamer);
     child_reset_streamer(ctx);
 
@@ -298,12 +309,15 @@ static int child_close_file_segment(ChildOutputCtx *ctx, int broken) {
     }
 
     ctx->current_segment_id = 0;
-    ctx->current_segment_start_ms = 0;
+    ctx->current_segment_start_wall_ms = 0;
+    ctx->current_segment_start_mono_ms = 0;
     ctx->current_segment_path[0] = '\0';
     return 0;
 }
 
-static int child_open_file_segment(ChildOutputCtx *ctx, int64_t start_ms) {
+static int child_open_file_segment(ChildOutputCtx *ctx,
+                                   int64_t start_wall_ms,
+                                   int64_t start_mono_ms) {
     int rc;
     int64_t segment_id = 0;
     char segment_path[PATH_MAX];
@@ -312,13 +326,19 @@ static int child_open_file_segment(ChildOutputCtx *ctx, int64_t start_ms) {
         return -1;
     }
 
-    rc = video_store_build_segment_path(&ctx->video_store, start_ms, segment_path, sizeof(segment_path));
+    rc = video_store_build_segment_path(&ctx->video_store,
+                                        start_wall_ms,
+                                        segment_path,
+                                        sizeof(segment_path));
     if (rc != 0) {
         fprintf(stderr, "[Child] Failed to build segment path: %d\n", rc);
         return -1;
     }
 
-    rc = video_store_begin_segment(&ctx->video_store, start_ms, segment_path, &segment_id);
+    rc = video_store_begin_segment(&ctx->video_store,
+                                   start_wall_ms,
+                                   segment_path,
+                                   &segment_id);
     if (rc != 0) {
         fprintf(stderr, "[Child] Failed to register segment: %d\n", rc);
         return -1;
@@ -335,41 +355,46 @@ static int child_open_file_segment(ChildOutputCtx *ctx, int64_t start_ms) {
     ctx->streamer_ready = 1;
     ctx->mode = CHILD_OUTPUT_FILE;
     ctx->current_segment_id = segment_id;
-    ctx->current_segment_start_ms = start_ms;
+    ctx->current_segment_start_wall_ms = start_wall_ms;
+    ctx->current_segment_start_mono_ms = start_mono_ms;
     snprintf(ctx->current_segment_path, sizeof(ctx->current_segment_path), "%s", segment_path);
 
     printf("[Child] Local segment started: %s\n", ctx->current_segment_path);
     return 0;
 }
 
-static int child_switch_to_file_mode(ChildOutputCtx *ctx, int64_t frame_ms) {
+static int child_switch_to_file_mode(ChildOutputCtx *ctx,
+                                     int64_t frame_mono_ms,
+                                     int64_t frame_wall_ms) {
     if (ctx->streamer_ready) {
         streamer_clean(&ctx->streamer);
         child_reset_streamer(ctx);
     }
 
     ctx->mode = CHILD_OUTPUT_FILE;
-    ctx->last_rtmp_retry_ms = frame_ms;
+    ctx->last_rtmp_retry_mono_ms = frame_mono_ms;
     child_reset_rtmp_backoff(ctx);
 
-    return child_open_file_segment(ctx, frame_ms);
+    return child_open_file_segment(ctx, frame_wall_ms, frame_mono_ms);
 }
 
-static int child_rotate_or_restore_output(ChildOutputCtx *ctx, int64_t frame_ms) {
+static int child_rotate_or_restore_output(ChildOutputCtx *ctx,
+                                          int64_t frame_mono_ms,
+                                          int64_t frame_wall_ms) {
     int rc;
 
     if (ctx->mode != CHILD_OUTPUT_FILE || !ctx->streamer_ready) {
         return 0;
     }
 
-    if (frame_ms - ctx->current_segment_start_ms < ctx->video_store.segment_duration_ms) {
+    if (frame_mono_ms - ctx->current_segment_start_mono_ms < ctx->video_store.segment_duration_ms) {
         return 0;
     }
 
     child_close_file_segment(ctx, 0);
 
-    if (frame_ms - ctx->last_rtmp_retry_ms >= ctx->rtmp_retry_backoff_ms) {
-        ctx->last_rtmp_retry_ms = frame_ms;
+    if (frame_mono_ms - ctx->last_rtmp_retry_mono_ms >= ctx->rtmp_retry_backoff_ms) {
+        ctx->last_rtmp_retry_mono_ms = frame_mono_ms;
         if (child_open_rtmp_output(ctx) == 0) {
             printf("[Child] RTMP output restored.\n");
             return 0;
@@ -380,7 +405,7 @@ static int child_rotate_or_restore_output(ChildOutputCtx *ctx, int64_t frame_ms)
                ctx->rtmp_retry_backoff_ms);
     }
 
-    rc = child_open_file_segment(ctx, frame_ms);
+    rc = child_open_file_segment(ctx, frame_wall_ms, frame_mono_ms);
     if (rc != 0) {
         fprintf(stderr, "[Child] Failed to open next local segment.\n");
         return -1;
@@ -391,7 +416,8 @@ static int child_rotate_or_restore_output(ChildOutputCtx *ctx, int64_t frame_ms)
 
 static int child_stream_loop(int sock) {
     ChildOutputCtx ctx;
-    int64_t frame_ms;
+    int64_t frame_mono_ms;
+    int64_t frame_wall_ms;
     int child_fd;
     int ret;
 
@@ -424,16 +450,17 @@ static int child_stream_loop(int sock) {
 
     if (child_open_rtmp_output(&ctx) < 0) {
         fprintf(stderr, "[Child] RTMP init failed, switch to local file mode.\n");
-        if (child_switch_to_file_mode(&ctx, now_ms()) < 0) {
+        if (child_switch_to_file_mode(&ctx, mono_now_ms(), wall_now_ms()) < 0) {
             return -1;
         }
     }
 
     while (is_running && (child_fd = recv_fd(sock)) >= 0) {
-        frame_ms = now_ms();
+        frame_mono_ms = mono_now_ms();
+        frame_wall_ms = wall_now_ms();
 
         if (ctx.mode == CHILD_OUTPUT_FILE) {
-            ret = child_rotate_or_restore_output(&ctx, frame_ms);
+            ret = child_rotate_or_restore_output(&ctx, frame_mono_ms, frame_wall_ms);
             if (ret < 0) {
                 close(child_fd);
                 break;
@@ -459,7 +486,7 @@ static int child_stream_loop(int sock) {
         if (ret < 0) {
             if (ctx.mode == CHILD_OUTPUT_RTMP && ctx.video_store_ready) {
                 fprintf(stderr, "[Child] RTMP push failed, switch to local file mode.\n");
-                if (child_switch_to_file_mode(&ctx, frame_ms) == 0) {
+                if (child_switch_to_file_mode(&ctx, frame_mono_ms, frame_wall_ms) == 0) {
                     ret = streamer_push_zerocopy(&ctx.streamer, child_fd);
                     if (ret == 0) {
                         char ack = 'k';
@@ -530,7 +557,7 @@ static int spawn_stream_child(StreamState *stream) {
     stream->child_pid = pid;
     stream->stream_online = 1;
     reset_restart_backoff(stream);
-    stream->last_restart_ms = now_ms();
+    stream->last_restart_mono_ms = mono_now_ms();
 
     printf("[Parent] Stream child started: pid=%d\n", pid);
     return 0;
@@ -555,12 +582,12 @@ static void try_restart_stream_child(StreamState *stream) {
         }
     }
 
-    now = now_ms();
-    if (now - stream->last_restart_ms < stream->current_restart_ms) {
+    now = mono_now_ms();
+    if (now - stream->last_restart_mono_ms < stream->current_restart_ms) {
         return;
     }
 
-    stream->last_restart_ms = now;
+    stream->last_restart_mono_ms = now;
     printf("[Parent] Try restart stream child after %d ms backoff...\n",
            stream->current_restart_ms);
 
@@ -582,7 +609,7 @@ int main(void) {
         .max_restart_ms = STREAM_RESTART_MAX_MS,
         .current_restart_ms = STREAM_RESTART_BASE_MS,
         .restart_fail_count = 0,
-        .last_restart_ms = 0,
+        .last_restart_mono_ms = 0,
     };
     int shmid = -1;
     void *shmaddr = (void *)-1;
@@ -679,10 +706,6 @@ int main(void) {
         }
     } else {
         printf("[Parent] Video uploader skipped: %s\n", video_uploader_reason);
-    }
-
-    if (stream.child_pid < 0) {
-        printf("[Parent] Initial stream child start failed, continue in offline mode.\n");
     }
 
     while (is_running) {
