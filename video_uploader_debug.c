@@ -27,6 +27,7 @@ typedef enum {
 
 typedef struct {
     VideoUploaderTestMode mode;
+    VideoUploader *uploader;
     VideoUploaderDebugCtx mock;
 } VideoUploaderDebugUploadCtx;
 
@@ -242,7 +243,7 @@ static int dispatch_upload_callback(const LocalVideoSegmentRecord *segment,
                                                    remote_path_size,
                                                    error_msg,
                                                    error_msg_size,
-                                                   NULL);
+                                                   ctx->uploader);
     }
 
     return mock_upload_callback(segment,
@@ -301,6 +302,7 @@ int main(int argc, char *argv[]) {
     upload_ctx.mode = strcmp(mode_arg, "http") == 0
                     ? VIDEO_UPLOADER_TEST_MODE_HTTP
                     : VIDEO_UPLOADER_TEST_MODE_MOCK;
+    upload_ctx.uploader = &uploader;
 
     rc = local_store_open(&store, root_dir);
     if (rc != 0) {

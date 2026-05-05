@@ -308,9 +308,13 @@ static int video_uploader_handle_one(VideoUploader *uploader) {
     char error_msg[LOCAL_STORE_MAX_PAYLOAD_LEN];
     int found = 0;
     int rc;
+    int upload_rc;
 
     if (!uploader->store_ready) {
         return ENOSYS;
+    }
+    if (uploader->stopping) {
+        return ECANCELED;
     }
 
     rc = local_store_fetch_oldest_pending_video_segment(&uploader->store, &segment, &found);
@@ -325,22 +329,28 @@ static int video_uploader_handle_one(VideoUploader *uploader) {
     if (rc != 0) {
         return rc;
     }
+    if (uploader->stopping) {
+        return ECANCELED;
+    }
 
     if (uploader->upload_fn == NULL) {
         snprintf(error_msg, sizeof(error_msg), "upload callback is not configured");
-        local_store_mark_video_segment_retry(&uploader->store, segment.id, error_msg);
+        rc = local_store_mark_video_segment_retry(&uploader->store, segment.id, error_msg);
+        if (rc != 0) {
+            return rc;
+        }
         return ENOSYS;
     }
 
     remote_path[0] = '\0';
     error_msg[0] = '\0';
-    rc = uploader->upload_fn(&segment,
-                             remote_path,
-                             sizeof(remote_path),
-                             error_msg,
-                             sizeof(error_msg),
-                             uploader->user_data);
-    if (rc == 0) {
+    upload_rc = uploader->upload_fn(&segment,
+                                    remote_path,
+                                    sizeof(remote_path),
+                                    error_msg,
+                                    sizeof(error_msg),
+                                    uploader->user_data);
+    if (upload_rc == 0) {
         rc = local_store_mark_video_segment_uploaded(&uploader->store,
                                                      segment.id,
                                                      remote_path,
@@ -354,8 +364,12 @@ static int video_uploader_handle_one(VideoUploader *uploader) {
         return rc;
     }
 
+    if (uploader->stopping) {
+        return ECANCELED;
+    }
+
     if (error_msg[0] == '\0') {
-        snprintf(error_msg, sizeof(error_msg), "upload callback failed: %d", rc);
+        snprintf(error_msg, sizeof(error_msg), "upload callback failed: %d", upload_rc);
     }
 
     rc = local_store_mark_video_segment_retry(&uploader->store, segment.id, error_msg);
@@ -364,7 +378,10 @@ static int video_uploader_handle_one(VideoUploader *uploader) {
                (long long)segment.id,
                error_msg);
     }
-    return rc;
+    if (rc != 0) {
+        return rc;
+    }
+    return upload_rc == 1 ? EIO : upload_rc;
 }
 
 static void *video_uploader_thread(void *arg) {
@@ -385,10 +402,13 @@ static void *video_uploader_thread(void *arg) {
 
     printf("[VideoUploader] Started, db=%s\n", uploader->store.db_path);
 
-    while (1) {
+    while (!uploader->stopping) {
         int wait_rc;
 
         rc = video_uploader_handle_one(uploader);
+        if (uploader->stopping) {
+            break;
+        }
         if (rc == 1) {
             wait_rc = video_uploader_wait(uploader, uploader->idle_interval_ms);
             if (wait_rc == 1) {
@@ -418,6 +438,12 @@ static void *video_uploader_thread(void *arg) {
     }
 
     if (uploader->store_ready) {
+        if (uploader->stopping) {
+            rc = local_store_reset_uploading_video_segments(&uploader->store);
+            if (rc != 0) {
+                fprintf(stderr, "[VideoUploader] reset uploading states on stop failed: %d\n", rc);
+            }
+        }
         local_store_close(&uploader->store);
         uploader->store_ready = 0;
     }
@@ -449,7 +475,7 @@ int video_uploader_start(VideoUploader *uploader,
         return rc;
     }
 
-    uploader->stop_event_fd = eventfd(0, EFD_CLOEXEC);
+    uploader->stop_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (uploader->stop_event_fd < 0) {
         return errno;
     }
@@ -465,18 +491,27 @@ int video_uploader_start(VideoUploader *uploader,
     return 0;
 }
 
-void video_uploader_stop(VideoUploader *uploader) {
+void video_uploader_request_stop(VideoUploader *uploader) {
     uint64_t one = 1;
+    int stop_fd;
 
     if (uploader == NULL || !uploader->started) {
         return;
     }
 
     uploader->stopping = 1;
-
-    if (write(uploader->stop_event_fd, &one, sizeof(one)) < 0 && errno != EAGAIN) {
-        perror("video_uploader_stop write");
+    stop_fd = uploader->stop_event_fd;
+    if (stop_fd >= 0) {
+        (void)write(stop_fd, &one, sizeof(one));
     }
+}
+
+void video_uploader_stop(VideoUploader *uploader) {
+    if (uploader == NULL || !uploader->started) {
+        return;
+    }
+
+    video_uploader_request_stop(uploader);
 
     pthread_join(uploader->tid, NULL);
     close(uploader->stop_event_fd);

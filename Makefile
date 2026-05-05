@@ -36,7 +36,7 @@ TARGET = main
 STORE_DEBUG_TARGET = store_debug
 MQTT_CHAIN_DEBUG_TARGET = mqtt_chain_debug
 VIDEO_UPLOADER_DEBUG_TARGET = video_uploader_debug
-SRCS = main.c camera.c ipc.c encoder.c aliyun_mqtt.c sensor_modbus.c local_store.c video_store.c video_uploader.c
+SRCS = main.c camera.c ipc.c encoder.c aliyun_mqtt.c sensor_modbus.c local_store.c video_store.c video_uploader.c relay_alarm.c
 OBJS = $(SRCS:.c=.o)
 STORE_DEBUG_OBJS = store_debug.o local_store.o
 MQTT_CHAIN_DEBUG_OBJS = mqtt_chain_debug.o aliyun_mqtt.o local_store.o

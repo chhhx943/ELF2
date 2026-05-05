@@ -25,7 +25,7 @@
 #include <time.h>
 
 #define VIDEO_DEV "/dev/video11"
-#define RTMP_URL "rtmp://192.168.31.122/live/test"
+#define RTMP_URL "rtmp://192.168.31.121/live/test"
 #define WIDTH  1280
 #define HEIGHT 720
 #define BUF_COUNT 4
@@ -38,6 +38,8 @@
 #define CHILD_RTMP_RETRY_MAX_MS 30000
 
 volatile sig_atomic_t is_running = 1;
+static volatile sig_atomic_t g_video_uploader_signal_ready = 0;
+static VideoUploader *g_video_uploader_for_signal = NULL;
 
 typedef struct {
     int stream_online;
@@ -82,6 +84,26 @@ typedef struct {
 static void sig_handler(int sig) {
     (void)sig;
     is_running = 0;
+    if (g_video_uploader_signal_ready) {
+        video_uploader_request_stop(g_video_uploader_for_signal);
+    }
+}
+
+static void install_signal_handlers(void) {
+    struct sigaction action;
+    struct sigaction ignore_action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sig_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+
+    memset(&ignore_action, 0, sizeof(ignore_action));
+    ignore_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_action.sa_mask);
+    sigaction(SIGPIPE, &ignore_action, NULL);
 }
 
 static int64_t mono_now_ms(void) {
@@ -421,8 +443,7 @@ static int child_stream_loop(int sock) {
     int child_fd;
     int ret;
 
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
+    install_signal_handlers();
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.rtmp_retry_backoff_ms = CHILD_RTMP_RETRY_BASE_MS;
@@ -547,6 +568,8 @@ static int spawn_stream_child(StreamState *stream) {
 
     if (pid == 0) {
         close(sv[0]);
+        g_video_uploader_for_signal = NULL;
+        g_video_uploader_signal_ready = 0;
         int ret = child_stream_loop(sv[1]);
         close(sv[1]);
         exit(ret == 0 ? 0 : 1);
@@ -620,9 +643,7 @@ int main(void) {
 
     memset(&video_uploader, 0, sizeof(video_uploader));
 
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-    signal(SIGPIPE, SIG_IGN);
+    install_signal_handlers();
 
     if (camera_init(&cam, VIDEO_DEV, WIDTH, HEIGHT) < 0) {
         fprintf(stderr, "Failed to init camera\n");
@@ -697,11 +718,13 @@ int main(void) {
         int rc = video_uploader_start(&video_uploader,
                                       NULL,
                                       video_uploader_http_upload_callback,
-                                      NULL);
+                                      &video_uploader);
         if (rc != 0) {
             fprintf(stderr, "[Parent] Failed to start video uploader: %s\n", strerror(rc));
         } else {
             video_uploader_started = 1;
+            g_video_uploader_for_signal = &video_uploader;
+            g_video_uploader_signal_ready = 1;
             printf("[Parent] Video uploader started\n");
         }
     } else {
@@ -756,11 +779,16 @@ int main(void) {
 
 cleanup:
     is_running = 0;
+    if (video_uploader_started) {
+        video_uploader_request_stop(&video_uploader);
+    }
+    g_video_uploader_signal_ready = 0;
     stop_mqtt_reporter();
     stop_stream_child(&stream);
     if (video_uploader_started) {
         video_uploader_stop(&video_uploader);
     }
+    g_video_uploader_for_signal = NULL;
 
     camera_stop(&cam);
     camera_deinit(&cam);
