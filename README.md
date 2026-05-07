@@ -41,6 +41,20 @@
 
 采集结果写入全局 `g_sensor_data`，由 `pthread_mutex_t lock` 保护。
 
+### 2.1. 继电器报警控制库
+
+`relay_alarm.c/.h` 当前只作为库模块使用，不再包含独立命令行测试入口。
+
+对外接口为：
+
+- `relay_alarm_set(int alarm_on)`
+- `relay_alarm_on(void)`
+- `relay_alarm_off(void)`
+
+`relay_alarm.c` 已经加入主程序 `main` 的编译源列表，后续主流程可以直接 `#include "relay_alarm.h"` 后调用这些接口。
+
+Makefile 不再构建 `relay_alarm` 独立可执行文件；如果目录里还存在旧的 `relay_alarm` 二进制，它只是历史构建产物，不会再由当前 Makefile 生成。
+
 ### 3. MQTT 正式行为
 
 `aliyun_mqtt.c` 里的正式线程使用：
@@ -225,6 +239,71 @@ SQLite 表当前保存：
 - `100000` 条
 
 超过上限时会删除最旧记录，避免 SD 卡被离线数据持续写满。
+
+### 10. AI 检测与 RGA 画框当前状态
+
+当前 AI 链路已经接入主流程：
+
+- 父进程从摄像头 DMA-BUF 取帧
+- 通过 RGA 把 NV12 预处理成 RKNN 输入需要的 RGB 640x640 letterbox 图
+- `rknn_worker` 后台线程执行 `./22/model/best.rknn`
+- 检测框通过共享内存传给推流子进程
+- 子进程在编码前用 RGA 把检测框画到 NV12 帧上
+
+RGA 画框链路已经用固定中心测试框验证通过。排查过程中遇到过：
+
+```text
+RGA draw box failed: Invalid parameters: dst, Error yuv not align to 2
+```
+
+原因是 NV12/YUV420 上使用 RGA `imfill_t()` 画矩形时，`x/y/w/h` 需要满足 2 对齐。当前测试框已经移除，正式逻辑只画真实检测框；画框前会把检测框坐标整理成偶数，并使用 `4` 像素边框，避免真实检测框因为奇数坐标触发同类错误。
+
+当前 RKNN 检测仍有一个已定位问题：主程序日志中持续出现：
+
+```text
+[Parent][AI] stats ... candidates=0 boxes=0
+```
+
+并且调试日志显示：
+
+```text
+[RKNN][debug] ... out_size=302400 elem=75600 dims=[1,9,8400] type=INT8 want_float=1 ... best_raw=0.000000 ... candidates=0 final=0
+```
+
+这里 `out_size=302400 = 75600 * 4`，说明 runtime 在 `want_float=1` 时确实返回了 float buffer，代码侧按 float 读取输出没有问题。进一步看模型输出量化参数：
+
+```text
+output0 type=INT8 zp=-128 scale=2.526220
+```
+
+YOLOv8 的最终输出 `[1,9,8400]` 中，前 4 个通道是 bbox 坐标，范围大约是 `0~640`；后 5 个通道是类别分数，范围通常是 `0~1`。当前模型把 bbox 和 class score 放在同一个 INT8 输出 tensor 里整体量化，bbox 的大范围把 scale 拉到 `2.526220`，导致 `0~1` 的类别分数精度基本丢失，最终最大类别分数也只有 `0.000000`。
+
+因此当前结论是：
+
+- RKNN 推理链路在跑，`processed` 增长且 `failed=0`
+- RGA 画框链路已经验证可以工作
+- `candidates=0` 的主要原因不是画框，也不是 `AI_CONF` 阈值
+- 当前 `best.rknn` 量化输出大概率已经把类别分数压成 0，代码侧无法恢复真实置信度
+
+已做的最小范围辅助修改：
+
+- `rknn_worker` 会根据 `outputs[0].size` 判断实际输出 buffer 是 float 还是 INT8/UINT8
+- 如果拿到 INT8/UINT8，会按 `zp/scale` 反量化
+- 每 60 帧打印一次 RKNN debug，便于确认最大类别分数、类别、box 值和候选框数量
+- `AI_CONF` 可通过环境变量调整，例如：
+
+```bash
+AI_CONF=0.05 ./main
+AI_CONF=0.01 ./main
+```
+
+但在当前量化模型下，降到 `0.01` 仍然没有候选框。
+
+下一步建议：
+
+- 重新转换一个非量化 RKNN，先使用 `do_quantization=False` 验证检测框输出
+- 或重新导出/转换时避免把 decoded YOLOv8 输出 `[1,9,8400]` 整体 INT8 量化
+- 同时建议让 RKNN Toolkit 和板端 runtime 版本尽量对齐；当前模型由 Toolkit `2.3.2` 编译，板端日志显示 runtime API 为 `2.1.0`
 
 ## 测试辅助
 
@@ -533,6 +612,12 @@ ip link set <wifi_if> up
 make
 ```
 
+说明：
+
+- `make` 当前只生成主程序 `main`
+- `relay_alarm.c` 会作为库代码链接进 `main`
+- 不再生成独立的 `relay_alarm` 可执行文件
+
 SQLite 单独测试：
 
 ```bash
@@ -567,6 +652,7 @@ make video_uploader_debug
 - `video_uploader` 自动补传 `pending` 视频片段
 - 上传成功后回写 `video_segments.state=uploaded`
 - 按 3GB 左右容量上限自动清理旧片段
+- `relay_alarm.c/.h` 已调整为主程序可直接链接调用的库模块
 
 还需要继续完善的能力：
 
