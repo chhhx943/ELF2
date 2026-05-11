@@ -358,9 +358,15 @@ static int rknn_worker_decode_yolov8(RknnWorker *worker,
 }
 
 static void rknn_worker_reset(RknnWorker *worker) {
+    int i;
+
     memset(worker, 0, sizeof(*worker));
     worker->ctx = 0;
     worker->stats.last_frame_seq = -1;
+    worker->pending_slot = -1;
+    for (i = 0; i < RKNN_WORKER_INPUT_SLOT_COUNT; i++) {
+        worker->input_slot_state[i] = 0;
+    }
 }
 
 static int rknn_worker_load_file(const char *path, unsigned char **data, size_t *size) {
@@ -625,11 +631,134 @@ static int rknn_worker_run_once(RknnWorker *worker,
     return ret;
 }
 
+static int rknn_worker_run_mem_once(RknnWorker *worker,
+                                    const RknnWorkerTaskMeta *meta,
+                                    rknn_tensor_mem *input_mem) {
+    rknn_tensor_attr input_attr;
+    rknn_output *outputs = NULL;
+    rknn_output_extend output_extend;
+    int64_t start_us;
+    int64_t end_us;
+    int ret;
+    uint32_t i;
+
+    if (worker == NULL || meta == NULL || input_mem == NULL) {
+        return -EINVAL;
+    }
+
+    if (worker->io_num.n_input < 1 || worker->input_attrs == NULL) {
+        return -EINVAL;
+    }
+
+    input_attr = worker->input_attrs[0];
+    input_attr.index = 0;
+    input_attr.type = RKNN_TENSOR_UINT8;
+    input_attr.fmt = RKNN_TENSOR_NHWC;
+    input_attr.pass_through = 0;
+    input_attr.size = (uint32_t)meta->size;
+    if (worker->input_info.width > 0) {
+        input_attr.w_stride = worker->input_info.width;
+    }
+    input_attr.h_stride = worker->input_info.height;
+
+    start_us = rknn_worker_now_us();
+
+    ret = rknn_set_io_mem(worker->ctx, input_mem, &input_attr);
+    if (ret != RKNN_SUCC) {
+        fprintf(stderr, "[RKNN] set input mem failed: %d frame=%lld fd=%d\n",
+                ret, (long long)meta->frame_seq, input_mem->fd);
+        return ret;
+    }
+
+    ret = rknn_run(worker->ctx, NULL);
+    if (ret != RKNN_SUCC) {
+        fprintf(stderr, "[RKNN] run failed: %d frame=%lld\n",
+                ret, (long long)meta->frame_seq);
+        return ret;
+    }
+
+    outputs = (rknn_output *)calloc(worker->io_num.n_output, sizeof(rknn_output));
+    if (outputs == NULL) {
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < worker->io_num.n_output; i++) {
+        outputs[i].index = i;
+        outputs[i].want_float = worker->want_float_outputs ? 1 : 0;
+        outputs[i].is_prealloc = 0;
+    }
+
+    memset(&output_extend, 0, sizeof(output_extend));
+    ret = rknn_outputs_get(worker->ctx, worker->io_num.n_output,
+                           outputs, &output_extend);
+    if (ret == RKNN_SUCC) {
+        (void)rknn_worker_decode_yolov8(worker, meta, outputs);
+        {
+            int release_ret = rknn_outputs_release(worker->ctx, worker->io_num.n_output, outputs);
+            if (release_ret != RKNN_SUCC) {
+                ret = release_ret;
+            }
+        }
+        if (ret != RKNN_SUCC) {
+            fprintf(stderr, "[RKNN] outputs_release failed: %d frame=%lld\n",
+                    ret, (long long)meta->frame_seq);
+        }
+    } else {
+        fprintf(stderr, "[RKNN] outputs_get failed: %d frame=%lld\n",
+                ret, (long long)meta->frame_seq);
+    }
+
+    free(outputs);
+    end_us = rknn_worker_now_us();
+
+    pthread_mutex_lock(&worker->lock);
+    worker->stats.last_infer_us = end_us > start_us ? end_us - start_us : 0;
+    pthread_mutex_unlock(&worker->lock);
+
+    return ret;
+}
+
+static int rknn_worker_alloc_input_mems(RknnWorker *worker) {
+    int i;
+
+    if (worker == NULL || worker->ctx == 0 || worker->input_size == 0) {
+        return EINVAL;
+    }
+
+    for (i = 0; i < RKNN_WORKER_INPUT_SLOT_COUNT; i++) {
+        uint32_t alloc_size = worker->input_attrs[0].size_with_stride > 0 ?
+                              worker->input_attrs[0].size_with_stride :
+                              (uint32_t)worker->input_size;
+
+        worker->input_mems[i] = rknn_create_mem2(worker->ctx,
+                                                 alloc_size,
+                                                 RKNN_FLAG_MEMORY_NON_CACHEABLE);
+        if (worker->input_mems[i] == NULL) {
+            fprintf(stderr, "[RKNN] create input dma-buf slot %d failed\n", i);
+            return ENOMEM;
+        }
+        if (worker->input_mems[i]->fd < 0 ||
+            worker->input_mems[i]->size < worker->input_size) {
+            fprintf(stderr,
+                    "[RKNN] invalid input dma-buf slot %d fd=%d size=%u need=%zu\n",
+                    i,
+                    worker->input_mems[i]->fd,
+                    worker->input_mems[i]->size,
+                    worker->input_size);
+            return EIO;
+        }
+        worker->input_slot_state[i] = 0;
+    }
+
+    return 0;
+}
+
 static void *rknn_worker_thread(void *arg) {
     RknnWorker *worker = (RknnWorker *)arg;
 
     while (1) {
         RknnWorkerTaskMeta meta;
+        int pending_slot;
         int ret;
 
         pthread_mutex_lock(&worker->lock);
@@ -643,13 +772,27 @@ static void *rknn_worker_thread(void *arg) {
         }
 
         meta = worker->pending_meta;
-        memcpy(worker->work_input, worker->pending_input, meta.size);
+        pending_slot = worker->pending_slot;
+        if (pending_slot < 0 && worker->pending_input != NULL && worker->work_input != NULL) {
+            memcpy(worker->work_input, worker->pending_input, meta.size);
+        }
         worker->pending_valid = 0;
+        worker->pending_slot = -1;
         pthread_mutex_unlock(&worker->lock);
 
-        ret = rknn_worker_run_once(worker, &meta, worker->work_input, meta.size);
+        if (pending_slot >= 0 && pending_slot < RKNN_WORKER_INPUT_SLOT_COUNT) {
+            ret = rknn_worker_run_mem_once(worker,
+                                           &meta,
+                                           worker->input_mems[pending_slot]);
+        } else {
+            ret = rknn_worker_run_once(worker, &meta, worker->work_input, meta.size);
+        }
 
         pthread_mutex_lock(&worker->lock);
+        if (pending_slot >= 0 && pending_slot < RKNN_WORKER_INPUT_SLOT_COUNT &&
+            worker->input_slot_state[pending_slot] == 2) {
+            worker->input_slot_state[pending_slot] = 0;
+        }
         if (ret == RKNN_SUCC) {
             worker->stats.processed++;
         } else {
@@ -757,6 +900,12 @@ int rknn_worker_start(RknnWorker *worker, const RknnWorkerConfig *config) {
         return rc;
     }
 
+    rc = rknn_worker_alloc_input_mems(worker);
+    if (rc != 0) {
+        rknn_worker_stop(worker);
+        return rc;
+    }
+
     worker->pending_input = (unsigned char *)malloc(worker->input_size);
     worker->work_input = (unsigned char *)malloc(worker->input_size);
     if (worker->pending_input == NULL || worker->work_input == NULL) {
@@ -790,6 +939,8 @@ void rknn_worker_request_stop(RknnWorker *worker) {
 }
 
 void rknn_worker_stop(RknnWorker *worker) {
+    int i;
+
     if (worker == NULL) {
         return;
     }
@@ -799,6 +950,17 @@ void rknn_worker_stop(RknnWorker *worker) {
     if (worker->thread_started) {
         pthread_join(worker->tid, NULL);
         worker->thread_started = 0;
+    }
+
+    for (i = 0; i < RKNN_WORKER_INPUT_SLOT_COUNT; i++) {
+        if (worker->input_mems[i] != NULL && worker->ctx != 0) {
+            int ret = rknn_destroy_mem(worker->ctx, worker->input_mems[i]);
+            if (ret != RKNN_SUCC) {
+                fprintf(stderr, "[RKNN] destroy input mem %d failed: %d\n", i, ret);
+            }
+            worker->input_mems[i] = NULL;
+        }
+        worker->input_slot_state[i] = 0;
     }
 
     if (worker->ctx != 0) {
@@ -846,6 +1008,11 @@ int rknn_worker_submit(RknnWorker *worker,
 
     pthread_mutex_lock(&worker->lock);
     if (worker->pending_valid) {
+        if (worker->pending_slot >= 0 &&
+            worker->pending_slot < RKNN_WORKER_INPUT_SLOT_COUNT &&
+            worker->input_slot_state[worker->pending_slot] == 2) {
+            worker->input_slot_state[worker->pending_slot] = 0;
+        }
         worker->stats.dropped++;
     }
 
@@ -853,11 +1020,110 @@ int rknn_worker_submit(RknnWorker *worker,
     worker->pending_meta.frame_seq = frame_seq;
     worker->pending_meta.timestamp_ms = timestamp_ms;
     worker->pending_meta.size = input_size;
+    worker->pending_slot = -1;
     worker->pending_valid = 1;
     worker->stats.submitted++;
     pthread_cond_signal(&worker->cond);
     pthread_mutex_unlock(&worker->lock);
 
+    return 0;
+}
+
+int rknn_worker_acquire_input_buffer(RknnWorker *worker, RknnWorkerInputBuffer *buffer) {
+    int i;
+
+    if (worker == NULL || buffer == NULL) {
+        return EINVAL;
+    }
+    if (!worker->ready || worker->stopping) {
+        return ECANCELED;
+    }
+
+    pthread_mutex_lock(&worker->lock);
+    if (!worker->ready || worker->stopping) {
+        pthread_mutex_unlock(&worker->lock);
+        return ECANCELED;
+    }
+
+    for (i = 0; i < RKNN_WORKER_INPUT_SLOT_COUNT; i++) {
+        if (worker->input_mems[i] != NULL && worker->input_slot_state[i] == 0) {
+            memset(buffer, 0, sizeof(*buffer));
+            worker->input_slot_state[i] = 1;
+            buffer->slot = i;
+            buffer->fd = worker->input_mems[i]->fd;
+            buffer->width = worker->input_info.width;
+            buffer->height = worker->input_info.height;
+            buffer->channels = worker->input_info.channels;
+            buffer->size = worker->input_info.size;
+            pthread_mutex_unlock(&worker->lock);
+            return 0;
+        }
+    }
+
+    worker->stats.dropped++;
+    pthread_mutex_unlock(&worker->lock);
+    return EBUSY;
+}
+
+void rknn_worker_release_input_buffer(RknnWorker *worker, int slot) {
+    if (worker == NULL ||
+        slot < 0 ||
+        slot >= RKNN_WORKER_INPUT_SLOT_COUNT ||
+        !worker->lock_ready) {
+        return;
+    }
+
+    pthread_mutex_lock(&worker->lock);
+    if (worker->input_slot_state[slot] == 1) {
+        worker->input_slot_state[slot] = 0;
+    }
+    pthread_mutex_unlock(&worker->lock);
+}
+
+int rknn_worker_submit_input_buffer(RknnWorker *worker,
+                                    int slot,
+                                    int64_t frame_seq,
+                                    int64_t timestamp_ms) {
+    if (worker == NULL ||
+        slot < 0 ||
+        slot >= RKNN_WORKER_INPUT_SLOT_COUNT) {
+        return EINVAL;
+    }
+    if (!worker->ready || worker->stopping) {
+        return ECANCELED;
+    }
+
+    pthread_mutex_lock(&worker->lock);
+    if (!worker->ready || worker->stopping) {
+        if (worker->input_slot_state[slot] == 1) {
+            worker->input_slot_state[slot] = 0;
+        }
+        pthread_mutex_unlock(&worker->lock);
+        return ECANCELED;
+    }
+    if (worker->input_mems[slot] == NULL || worker->input_slot_state[slot] != 1) {
+        pthread_mutex_unlock(&worker->lock);
+        return EINVAL;
+    }
+
+    if (worker->pending_valid) {
+        if (worker->pending_slot >= 0 &&
+            worker->pending_slot < RKNN_WORKER_INPUT_SLOT_COUNT &&
+            worker->input_slot_state[worker->pending_slot] == 2) {
+            worker->input_slot_state[worker->pending_slot] = 0;
+        }
+        worker->stats.dropped++;
+    }
+
+    worker->pending_meta.frame_seq = frame_seq;
+    worker->pending_meta.timestamp_ms = timestamp_ms;
+    worker->pending_meta.size = worker->input_size;
+    worker->pending_slot = slot;
+    worker->pending_valid = 1;
+    worker->input_slot_state[slot] = 2;
+    worker->stats.submitted++;
+    pthread_cond_signal(&worker->cond);
+    pthread_mutex_unlock(&worker->lock);
     return 0;
 }
 

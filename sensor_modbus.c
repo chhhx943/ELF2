@@ -89,7 +89,7 @@ static void* sensor_thread_func(void* arg) {
         return NULL;
     }
     connected = 1;
-    printf("[传感器] 成功连接到串? %s\n", path);
+    printf("[传感器] 成功连接到串口%s\n", path);
 
     while (is_running) {
         uint16_t regs[10] = {0};
@@ -143,7 +143,7 @@ static void* sensor_thread_func(void* arg) {
                                     &read_warn_count);
         }
 
-        // 2. 读取运行/预热状?
+        // 2. 读取运行/预热状态
         if (consecutive_failures < SENSOR_READ_FAIL_RECONNECT_THRESHOLD) {
             rc = modbus_read_registers(ctx, 0x001C, 1, regs);
             if (rc != -1) {

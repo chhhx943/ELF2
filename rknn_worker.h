@@ -9,6 +9,7 @@
 #include "rknn_api.h"
 
 #define RKNN_WORKER_DEFAULT_MODEL_PATH "./22/model/best.rknn"
+#define RKNN_WORKER_INPUT_SLOT_COUNT 2
 
 typedef struct {
     const char *model_path;
@@ -52,6 +53,15 @@ typedef struct {
 } RknnWorkerTaskMeta;
 
 typedef struct {
+    int slot;
+    int fd;
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+    uint32_t size;
+} RknnWorkerInputBuffer;
+
+typedef struct {
     pthread_t tid;
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -70,7 +80,10 @@ typedef struct {
     unsigned char *pending_input;
     unsigned char *work_input;
     int pending_valid;
+    int pending_slot;
     RknnWorkerTaskMeta pending_meta;
+    rknn_tensor_mem *input_mems[RKNN_WORKER_INPUT_SLOT_COUNT];
+    int input_slot_state[RKNN_WORKER_INPUT_SLOT_COUNT];
 
     int want_float_outputs;
     float conf_threshold;
@@ -91,6 +104,12 @@ int rknn_worker_submit(RknnWorker *worker,
                        size_t input_size,
                        int64_t frame_seq,
                        int64_t timestamp_ms);
+int rknn_worker_acquire_input_buffer(RknnWorker *worker, RknnWorkerInputBuffer *buffer);
+void rknn_worker_release_input_buffer(RknnWorker *worker, int slot);
+int rknn_worker_submit_input_buffer(RknnWorker *worker,
+                                    int slot,
+                                    int64_t frame_seq,
+                                    int64_t timestamp_ms);
 int rknn_worker_get_input_info(RknnWorker *worker, RknnWorkerInputInfo *info);
 void rknn_worker_get_stats(RknnWorker *worker, RknnWorkerStats *stats);
 int rknn_worker_is_ready(RknnWorker *worker);

@@ -105,7 +105,6 @@ typedef struct {
     int enabled;
     int frame_interval;
     uint64_t frame_seq;
-    unsigned char *input_buf;
     size_t input_size;
     RknnWorkerInputInfo input_info;
     int64_t last_stats_log_ms;
@@ -255,11 +254,11 @@ static float env_to_float_range(const char *name, float fallback, float min_valu
     return parsed;
 }
 
-static int ai_preprocess_dma_to_rgb(int dma_fd,
-                                    const RknnWorkerInputInfo *input_info,
-                                    unsigned char *dst_data) {
+static int ai_preprocess_dma_to_rgb_fd(int dma_fd,
+                                       const RknnWorkerInputBuffer *input_buffer) {
     rga_buffer_t src;
     rga_buffer_t dst;
+    im_rect fill_rect;
     im_rect src_rect;
     im_rect dst_rect;
     IM_STATUS status;
@@ -270,14 +269,14 @@ static int ai_preprocess_dma_to_rgb(int dma_fd,
     uint32_t left;
     uint32_t top;
 
-    if (dma_fd < 0 || input_info == NULL || dst_data == NULL ||
-        input_info->width == 0 || input_info->height == 0 ||
-        input_info->channels != 3) {
+    if (dma_fd < 0 || input_buffer == NULL || input_buffer->fd < 0 ||
+        input_buffer->width == 0 || input_buffer->height == 0 ||
+        input_buffer->channels != 3) {
         return -1;
     }
 
-    dst_width = input_info->width;
-    dst_height = input_info->height;
+    dst_width = input_buffer->width;
+    dst_height = input_buffer->height;
     if ((uint64_t)dst_width * HEIGHT <= (uint64_t)dst_height * WIDTH) {
         resized_width = dst_width;
         resized_height = (uint32_t)(((uint64_t)HEIGHT * dst_width) / WIDTH);
@@ -289,18 +288,22 @@ static int ai_preprocess_dma_to_rgb(int dma_fd,
         return -1;
     }
 
-    memset(dst_data, 114, input_info->size);
-
     src = wrapbuffer_fd(dma_fd, WIDTH, HEIGHT, RK_FORMAT_YCbCr_420_SP);
     src.wstride = WIDTH;
     src.hstride = HEIGHT;
 
-    dst = wrapbuffer_virtualaddr(dst_data,
-                                 (int)dst_width,
-                                 (int)dst_height,
-                                 RK_FORMAT_RGB_888);
+    dst = wrapbuffer_fd(input_buffer->fd,
+                        (int)dst_width,
+                        (int)dst_height,
+                        RK_FORMAT_RGB_888);
     dst.wstride = (int)dst_width;
     dst.hstride = (int)dst_height;
+
+    fill_rect = (im_rect){0, 0, (int)dst_width, (int)dst_height};
+    status = imfill_t(dst, fill_rect, 0x727272, IM_SYNC);
+    if (status != IM_STATUS_SUCCESS) {
+        return -1;
+    }
 
     src_rect = (im_rect){0, 0, WIDTH, HEIGHT};
     left = (dst_width - resized_width) / 2;
@@ -378,16 +381,9 @@ static int ai_pipeline_start(AiPipeline *ai, DetectSharedState *detect_state) {
     }
 
     ai->input_size = ai->input_info.size;
-    ai->input_buf = (unsigned char *)malloc(ai->input_size);
-    if (ai->input_buf == NULL) {
-        fprintf(stderr, "[Parent][AI] input buffer alloc failed, size=%zu\n", ai->input_size);
-        rknn_worker_stop(&ai->worker);
-        ai->enabled = 0;
-        return ENOMEM;
-    }
 
     ai->started = 1;
-    printf("[Parent][AI] RKNN worker ready, input=%ux%ux%u interval=%d model=%s\n",
+    printf("[Parent][AI] RKNN worker ready, dma-buf input=%ux%ux%u interval=%d model=%s\n",
            ai->input_info.width,
            ai->input_info.height,
            ai->input_info.channels,
@@ -397,6 +393,7 @@ static int ai_pipeline_start(AiPipeline *ai, DetectSharedState *detect_state) {
 }
 
 static void ai_pipeline_process_frame(AiPipeline *ai, int dma_fd, int64_t frame_wall_ms) {
+    RknnWorkerInputBuffer input_buffer;
     int rc;
 
     if (ai == NULL || !ai->started || !rknn_worker_is_ready(&ai->worker)) {
@@ -409,8 +406,20 @@ static void ai_pipeline_process_frame(AiPipeline *ai, int dma_fd, int64_t frame_
         return;
     }
 
-    rc = ai_preprocess_dma_to_rgb(dma_fd, &ai->input_info, ai->input_buf);
+    rc = rknn_worker_acquire_input_buffer(&ai->worker, &input_buffer);
+    if (rc == EBUSY) {
+        return;
+    }
     if (rc != 0) {
+        if (rc != ECANCELED) {
+            fprintf(stderr, "[Parent][AI] acquire input dma-buf failed: %s\n", strerror(rc));
+        }
+        return;
+    }
+
+    rc = ai_preprocess_dma_to_rgb_fd(dma_fd, &input_buffer);
+    if (rc != 0) {
+        rknn_worker_release_input_buffer(&ai->worker, input_buffer.slot);
         ai->preproc_fail_count++;
         if (ai->preproc_fail_count == 1 || (ai->preproc_fail_count % 100) == 0) {
             fprintf(stderr, "[Parent][AI] preprocess failed count=%llu\n",
@@ -419,13 +428,15 @@ static void ai_pipeline_process_frame(AiPipeline *ai, int dma_fd, int64_t frame_
         return;
     }
 
-    rc = rknn_worker_submit(&ai->worker,
-                            ai->input_buf,
-                            ai->input_size,
-                            (int64_t)ai->frame_seq,
-                            frame_wall_ms);
-    if (rc != 0 && rc != ECANCELED) {
-        fprintf(stderr, "[Parent][AI] submit failed: %s\n", strerror(rc));
+    rc = rknn_worker_submit_input_buffer(&ai->worker,
+                                         input_buffer.slot,
+                                         (int64_t)ai->frame_seq,
+                                         frame_wall_ms);
+    if (rc != 0) {
+        rknn_worker_release_input_buffer(&ai->worker, input_buffer.slot);
+        if (rc != ECANCELED) {
+            fprintf(stderr, "[Parent][AI] submit failed: %s\n", strerror(rc));
+        }
     }
 }
 
@@ -465,8 +476,6 @@ static void ai_pipeline_stop(AiPipeline *ai) {
         rknn_worker_stop(&ai->worker);
         ai->started = 0;
     }
-    free(ai->input_buf);
-    ai->input_buf = NULL;
     ai->input_size = 0;
 }
 
